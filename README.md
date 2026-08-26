@@ -1,33 +1,58 @@
 # opencode-git-add
 
-opencode 插件:每轮对话结束后自动执行 `git add .`。
+An [opencode](https://opencode.ai) plugin that runs `git add .` after every finished conversation turn, but only in jujutsu colocated repositories (where both `.git` and `.jj` exist).
 
-仅在 jujutsu colocated 仓库中生效(即 `.git` 和 `.jj` 同时存在时才执行),避免影响纯 git 或纯 jj 的项目。
+## Motivation
 
-## 为什么是插件而不是配置
+Zed's per-turn agent diff view (the accordion above the agent panel showing what the agent changed in each turn) no longer exists for external ACP-connected agents.
 
-opencode 的 `opencode.json` 目前不支持任何原生 hook/事件字段(见 [config schema](https://opencode.ai/config.json)),"每轮对话结束后"这类时机只能通过 [插件的事件系统](https://opencode.ai/docs/plugins/#events) 实现,这里用的是 `session.idle` 事件。
+In [zed-industries/zed#54918](https://github.com/zed-industries/zed/issues/54918) ("Agents' turn diffs disappeared from Zed"), the Zed team confirmed this is unlikely to come back. The blocker is at the ACP protocol level: the agent's changes are not attributable to a specific turn, because agents typically write directly through the filesystem and ACP cannot distinguish user edits from agent edits.
 
-## 安装
+The maintainers pointed to [zed-industries/zed#26560](https://github.com/zed-industries/zed/issues/26560) ("Staged and Unstaged diffs") as the viable alternative: a long-requested feature to view unstaged diffs separately in the git panel.
 
-将 `git-add.ts` 放到全局插件目录(对所有项目生效),或放到具体项目的 `.opencode/plugins/` 下:
+This plugin implements the workflow that makes #26560 usable for reviewing a single turn's changes:
+
+1. When a turn finishes, the plugin immediately stages everything (`git add .`) in colocated jj/git repos.
+2. The staged set now represents the work of completed turns; the unstaged diff in Zed only ever contains changes made since the last turn ended.
+3. So at any moment, the unstaged diff view shows exactly what the current turn has changed so far — the per-turn review surface that the agent panel diff used to provide.
+
+## Why a plugin instead of config
+
+opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "after each turn" are only possible through the [plugin event system](https://opencode.ai/docs/plugins/#events), which exposes `session.idle`.
+
+## Installation
+
+### npm (this package)
+
+Add it to the `plugin` array in `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-git-add"]
+}
+```
+
+### Manual
+
+Drop `git-add.ts` into the global plugin directory (applies to all projects), or into a project's `.opencode/plugins/`:
 
 ```sh
 mkdir -p ~/.config/opencode/plugins
 cp git-add.ts ~/.config/opencode/plugins/
 ```
 
-重启 opencode 后生效(配置只在启动时加载一次)。无需改动 `opencode.json`。
+Restart opencode afterwards — configuration is only loaded at startup. No changes to `opencode.json` are required when installing manually.
 
-## 行为
+## Behavior
 
-- 触发时机:`session.idle` —— 每一轮对话(assistant 回复完成、会话进入空闲)后触发一次。`git add .` 是幂等操作,即使空闲事件在会话刚创建时也触发一次,也没有副作用。
-- 执行条件:插件启动目录下 `.git` 与 `.jj` **同时存在**(对应 jj git colocated 工作副本),任一缺失则跳过。
-- 执行内容:`git add .`(在工作目录内执行,不递归到子项目)。
+- **Trigger:** `session.idle` — fires after each turn completes when the session becomes idle. `git add .` is idempotent, so the extra trigger on session creation is harmless.
+- **Guard:** runs only when both `.git` and `.jj` exist in the plugin's working directory (a jujutsu colocated working copy). Pure git and pure jj projects are skipped.
+- **Action:** `git add .` in the working directory, without recursing into nested projects.
 
-## 验证
+## Verification
 
-`scripts/verify.ts` 覆盖 5 个场景:.git+.jj 都存在会 staging;仅 .git / 仅 .jj / 都没有时跳过且不报错;非 `session.idle` 事件不触发。运行:
+`scripts/verify.ts` covers 5 scenarios: both `.git` and `.jj` present → changes get staged; only `.git` / only `.jj` / neither → skipped without error; non-`session.idle` events → no-op. Run with:
 
 ```sh
 bun scripts/verify.ts
