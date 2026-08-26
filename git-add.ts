@@ -2,13 +2,19 @@ import { exists } from "node:fs/promises"
 import { join } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 
-// Auto-stage all changes after every finished turn, but only inside git
-// repositories (a .git directory present, which also covers jujutsu colocated
-// working copies).
-export const GitAddOnIdle: Plugin = async ({ directory, $ }) => {
+// At the start of each new turn (when the user submits a message), stage
+// everything the previous turn left behind. The unstaged diff in the editor
+// then always shows only the in-progress turn's changes.
+export const GitAddOnNewTurn: Plugin = async ({ directory, $ }) => {
+  let lastStagedMessageID: string | undefined
+
   return {
     event: async ({ event }) => {
-      if (event.type !== "session.idle") return
+      if (event.type !== "message.updated") return
+      const { info } = event.properties
+      if (info.role !== "user") return
+      if (info.id === lastStagedMessageID) return
+      lastStagedMessageID = info.id
       if (!(await exists(join(directory, ".git")))) return
       await $`git add .`.cwd(directory).quiet()
     },

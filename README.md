@@ -1,6 +1,6 @@
 # opencode-git-add
 
-An [opencode](https://opencode.ai) plugin that runs `git add .` after every finished conversation turn, in any git repository.
+An [opencode](https://opencode.ai) plugin that runs `git add .` at the start of every new conversation turn, in any git repository.
 
 ## Motivation
 
@@ -12,19 +12,22 @@ The maintainers pointed to [zed-industries/zed#26560](https://github.com/zed-ind
 
 This plugin implements the workflow that makes #26560 usable for reviewing a single turn's changes:
 
-1. When a turn finishes, the plugin immediately stages everything (`git add .`) in the working directory.
-2. The staged set now represents the work of completed turns; the unstaged diff in Zed only ever contains changes made since the last turn ended.
-3. So at any moment, the unstaged diff view shows exactly what the current turn has changed so far — the per-turn review surface that the agent panel diff used to provide.
+1. While a turn is running, the agent's changes accumulate as unstaged changes in the working tree.
+2. When the turn finishes, you review its diff in the editor's unstaged diff view — nothing has been touched yet.
+3. When you start the next turn, the plugin stages everything at that moment (`git add .`), freezing the previous turn's changes out of the unstaged view.
+4. The unstaged diff now holds only the new turn's changes again — the per-turn review surface that the agent panel diff used to provide.
+
+Timing matters: staging happens at the **start** of the next turn, never at the end of the current one. Staging right after a turn finishes would make the changes you want to review disappear into the staged set before you had a chance to look at them.
 
 ### Who is this for
 
 The plugin fits jujutsu users naturally: jj has no staging area, so staging has no meaning there and auto-running `git add .` interferes with nothing — the plugin simply leaves a clean snapshot boundary between turns.
 
-Plain git users who rely on the staging area should be aware: if you curate commits by selectively staging files (e.g. `git add <file>` before committing only some changes), this plugin will destroy that workflow, because everything gets staged automatically at the end of every turn. It is only a good fit if you always commit everything at once anyway.
+Plain git users who rely on the staging area should be aware: if you curate commits by selectively staging files (e.g. `git add <file>` before committing only some changes), this plugin will destroy that workflow, because everything gets staged automatically at the start of every turn. It is only a good fit if you always commit everything at once anyway.
 
 ## Why a plugin instead of config
 
-opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "after each turn" are only possible through the [plugin event system](https://opencode.ai/docs/plugins/#events), which exposes `session.idle`.
+opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "at the start of each turn" are only possible through the [plugin event system](https://opencode.ai/docs/plugins/#events), which exposes `message.updated`.
 
 ## Installation
 
@@ -52,13 +55,14 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 
 ## Behavior
 
-- **Trigger:** `session.idle` — fires after each turn completes when the session becomes idle. `git add .` is idempotent, so the extra trigger on session creation is harmless.
+- **Trigger:** `message.updated` for a user message — i.e. the moment you submit a new prompt and a new turn begins. The plugin stages whatever the previous turn left in the working tree before the agent starts doing anything (the event fires on message creation, ahead of any tool execution).
+- **Dedup:** the same user message ID only triggers once (opencode may re-emit an update for the same message, e.g. when its summary changes).
 - **Guard:** runs only when a `.git` directory exists in the plugin's working directory (this includes jujutsu colocated working copies). Non-git directories are skipped.
 - **Action:** `git add .` in the working directory, without recursing into nested projects.
 
 ## Verification
 
-`scripts/verify.ts` covers 5 scenarios: plain git repo → changes get staged; colocated jj repo (.git + .jj) → staged; only `.jj` / neither → skipped without error; non-`session.idle` events → no-op. Run with:
+`scripts/verify.ts` covers 7 scenarios: plain git repo → staged; colocated jj repo (.git + .jj) → staged; only `.jj` / neither → skipped without error; assistant `message.updated` → no-op; duplicate user message id → staged only once; unrelated event types → no-op. Run with:
 
 ```sh
 bun scripts/verify.ts
