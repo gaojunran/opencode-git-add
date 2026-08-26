@@ -1,6 +1,6 @@
 # opencode-git-add
 
-An [opencode](https://opencode.ai) plugin that runs `git add .` after every finished conversation turn, but only in jujutsu colocated repositories (where both `.git` and `.jj` exist).
+An [opencode](https://opencode.ai) plugin that runs `git add .` after every finished conversation turn, in any git repository.
 
 ## Motivation
 
@@ -12,9 +12,15 @@ The maintainers pointed to [zed-industries/zed#26560](https://github.com/zed-ind
 
 This plugin implements the workflow that makes #26560 usable for reviewing a single turn's changes:
 
-1. When a turn finishes, the plugin immediately stages everything (`git add .`) in colocated jj/git repos.
+1. When a turn finishes, the plugin immediately stages everything (`git add .`) in the working directory.
 2. The staged set now represents the work of completed turns; the unstaged diff in Zed only ever contains changes made since the last turn ended.
 3. So at any moment, the unstaged diff view shows exactly what the current turn has changed so far — the per-turn review surface that the agent panel diff used to provide.
+
+### Who is this for
+
+The plugin fits jujutsu users naturally: jj has no staging area, so staging has no meaning there and auto-running `git add .` interferes with nothing — the plugin simply leaves a clean snapshot boundary between turns.
+
+Plain git users who rely on the staging area should be aware: if you curate commits by selectively staging files (e.g. `git add <file>` before committing only some changes), this plugin will destroy that workflow, because everything gets staged automatically at the end of every turn. It is only a good fit if you always commit everything at once anyway.
 
 ## Why a plugin instead of config
 
@@ -47,12 +53,12 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 ## Behavior
 
 - **Trigger:** `session.idle` — fires after each turn completes when the session becomes idle. `git add .` is idempotent, so the extra trigger on session creation is harmless.
-- **Guard:** runs only when both `.git` and `.jj` exist in the plugin's working directory (a jujutsu colocated working copy). Pure git and pure jj projects are skipped.
+- **Guard:** runs only when a `.git` directory exists in the plugin's working directory (this includes jujutsu colocated working copies). Non-git directories are skipped.
 - **Action:** `git add .` in the working directory, without recursing into nested projects.
 
 ## Verification
 
-`scripts/verify.ts` covers 5 scenarios: both `.git` and `.jj` present → changes get staged; only `.git` / only `.jj` / neither → skipped without error; non-`session.idle` events → no-op. Run with:
+`scripts/verify.ts` covers 5 scenarios: plain git repo → changes get staged; colocated jj repo (.git + .jj) → staged; only `.jj` / neither → skipped without error; non-`session.idle` events → no-op. Run with:
 
 ```sh
 bun scripts/verify.ts
