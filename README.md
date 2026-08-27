@@ -56,13 +56,14 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 ## Behavior
 
 - **Trigger:** `message.updated` for a user message — i.e. the moment you submit a new prompt and a new turn begins. The plugin stages whatever the previous turn left in the working tree before the agent starts doing anything (the event fires on message creation, ahead of any tool execution).
+- **Main sessions only:** subagent sessions are skipped. opencode titles a subagent session `<description> (@<agent> subagent)` (the same signal the TUI uses to detect them), and the plugin resolves the message's session before staging, so turns spawned by the `task` tool mid-turn never trigger a staging. If the session cannot be resolved (e.g. an API hiccup), the plugin skips and logs a warning instead of staging at a wrong moment.
 - **Dedup:** the same user message ID only triggers once (opencode may re-emit an update for the same message, e.g. when its summary changes).
 - **Guard:** runs only when a `.git` directory exists in the plugin's working directory (this includes jujutsu colocated working copies). Non-git directories are skipped.
 - **Action:** `git add .` in the working directory, without recursing into nested projects.
 
 ## Verification
 
-`scripts/verify.ts` covers 7 scenarios: plain git repo → staged; colocated jj repo (.git + .jj) → staged; only `.jj` / neither → skipped without error; assistant `message.updated` → no-op; duplicate user message id → staged only once; unrelated event types → no-op. Run with:
+`scripts/verify.ts` covers 8 scenarios: main-session user message in a plain git repo → staged; subagent session (title ending in `(@agent subagent)`) → skipped; session lookup 404 / rejected → skipped without error; only `.jj` / neither → skipped; assistant `message.updated` → no-op; duplicate user message id → staged only once; unrelated event types → no-op. Run with:
 
 ```sh
 bun scripts/verify.ts
