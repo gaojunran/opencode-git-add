@@ -57,7 +57,7 @@ Optional configuration, as an options tuple (see [plugins docs](https://opencode
 }
 ```
 
-`skipSessionTitlePatterns` takes an array of regex strings; sessions whose title matches any of them are skipped. The magic-context child-session prefix `^magic-context-` is always included by default, so magic-context's summarizer/sidekick/dreamer sessions never trigger staging even without configuration — entries here are appended to the default.
+`skipSessionTitlePatterns` takes an array of regex strings; sessions whose title matches any of them are skipped. It is **empty by default** — the injected-message check below already covers every known source (magic-context, slim and opencode's own task machinery all mark their injected parts `synthetic`/`ignored`), so this option is only needed for exotic sessions whose messages cannot be inspected.
 
 ### Manual
 
@@ -81,7 +81,7 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 
 ## Verification
 
-`scripts/verify.ts` covers 15 scenarios: main-session user message in a plain git repo → staged; subagent session (title ending in `(@agent subagent)`) → skipped; magic-context child session title (`magic-context-*`) → skipped; user-configured `skipSessionTitlePatterns` → skipped; synthetic/ignored injected user message in the main session → skipped; real user message with plain text parts → staged; session lookup 404 / rejected → skipped without error; messages lookup rejected / parts never appearing (projector lag) → skipped without error; only `.jj` / neither → skipped; assistant `message.updated` → no-op; duplicate user message id → staged only once; unrelated event types → no-op. Run with:
+`scripts/verify.ts` covers 15 scenarios: main-session user message in a plain git repo → staged; subagent session (title ending in `(@agent subagent)`) → skipped; session lookup 404 / rejected → skipped without error; a magic-context-style injected message → skipped by the parts check regardless of session title; only `.jj` / neither → skipped; assistant `message.updated` → no-op; duplicate user message id → staged only once; unrelated event types → no-op. Injected-message detection is covered for synthetic-only parts, ignored-only parts, and real user input with plain text parts; a user-configured `skipSessionTitlePatterns` → skipped; messages lookup with parts never appearing / rejected → skipped without error. Run with:
 
 ```sh
 bun scripts/verify.ts

@@ -177,14 +177,18 @@ await fireTurn(
 const stagedAfterWrongEvent = await stagedFiles(d1)
 const ok8 = stagedAfterWrongEvent.length === 0
 
-// 9. magic-context child session title -> NOT staged (default pattern)
+// 9. magic-context child session title -> NOT staged only when the user
+// configures the pattern (no default prefix anymore; the injected-parts
+// check handles magic-context regardless of title)
 const d9 = await scenario(
   "magic-context-title",
   async (d) => {
     await bun$`git init -q ${d}`
     await writeFile(join(d, "a.txt"), "hello")
   },
-  makeClient("magic-context-sidekick"),
+  makeClient("magic-context-sidekick", [
+    { info: { id: "msg-1", sessionID: "ses-main" }, parts: [{ type: "text", text: "nudge", synthetic: true }] },
+  ]),
 )
 const staged9 = await stagedFiles(d9)
 const ok9 = staged9.length === 0

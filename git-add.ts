@@ -13,15 +13,13 @@ async function journal(line: string) {
 // opencode's task tool — same signal the TUI uses to detect them.
 const SUBAGENT_TITLE = /@[\w-]+ subagent\)?$/i
 
-// opencode's magic-context plugin runs its summarizer/sidekick/dreamer work in
-// child sessions titled with this prefix.
-const MAGIC_CONTEXT_TITLE = /^magic-context-/
-
 export interface GitAddOnNewTurnOptions {
   /**
    * Session titles matching any of these regexes are skipped (no git add).
-   * The magic-context child-session prefix `^magic-context-` is always
-   * included; entries here are appended to it.
+   * This is only needed for sessions the injected-message check below cannot
+   * see into; every known injected-message source (magic-context, slim and
+   * opencode's own task machinery) marks its parts synthetic/ignored and is
+   * already skipped by that check. Empty by default.
    */
   skipSessionTitlePatterns?: string[]
 }
@@ -50,10 +48,7 @@ export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?
   let lastStagedMessageID: string | undefined
 
   const opts = (options ?? {}) as GitAddOnNewTurnOptions
-  const skipSessionTitle = [
-    MAGIC_CONTEXT_TITLE,
-    ...(opts.skipSessionTitlePatterns ?? []).map((p) => new RegExp(p)),
-  ]
+  const skipSessionTitle = (opts.skipSessionTitlePatterns ?? []).map((p) => new RegExp(p))
 
   return {
     event: async ({ event }) => {
