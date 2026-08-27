@@ -72,3 +72,9 @@ bun scripts/verify.ts
 ## License
 
 MIT
+## Debugging
+
+The hook journals every event it sees and the decision taken to
+`/tmp/opencode-git-add.log` (append-only, safe to leave on). When reporting a
+misbehaviour, include that file — it shows exactly which events fired, in what
+order, and whether staging ran.
