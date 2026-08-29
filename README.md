@@ -27,7 +27,7 @@ Plain git users who rely on the staging area should be aware: if you curate comm
 
 ## Why a plugin instead of config
 
-opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "at the start of each turn" are only possible through the [plugin event system](https://opencode.ai/docs/plugins/#events), which exposes `message.updated`.
+opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "at the start of each turn" are only possible through the [plugin hook system](https://opencode.ai/docs/plugins/). This plugin uses the `chat.message` hook, which fires exactly once per prompt submission — before the message is persisted and before any tool runs.
 
 ## Installation
 
@@ -72,16 +72,16 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 
 ## Behavior
 
-- **Trigger:** `message.updated` for a user message — i.e. the moment you submit a new prompt and a new turn begins. The plugin stages whatever the previous turn left in the working tree before the agent starts doing anything (the event fires on message creation, ahead of any tool execution).
-- **Main sessions only:** subagent sessions are skipped. opencode titles a subagent session `<description> (@<agent> subagent)` (the same signal the TUI uses to detect them), and the plugin resolves the message's session before staging, so turns spawned by the `task` tool mid-turn never trigger a staging. If the session cannot be resolved (e.g. an API hiccup), the plugin skips and logs a warning instead of staging at a wrong moment.
-- **No injected messages:** opencode plugins can inject synthetic user messages into a session (e.g. magic-context's progress notices and summary posts), which broadcast the same `message.updated` event as a real user turn. The plugin looks the triggering message up via the session API and skips staging when every part carries the `synthetic` or `ignored` flag — real user input always has at least one unflagged text part.
-- **Dedup:** the same user message ID only triggers once (opencode may re-emit an update for the same message, e.g. when its summary changes).
+- **Trigger:** the `chat.message` hook — the moment you submit a new prompt and a new turn begins. opencode fires it exactly once per submission, before the message is persisted and before the agent starts doing anything, and never re-fires it when the message row is later updated (e.g. diff-summary recomputation). Earlier versions listened to the `message.updated` bus event instead, which opencode re-broadcasts on every summary update — combined with plugin-injected synthetic messages, that could cause spurious mid-turn staging (fixed in v0.7.0).
+- **Main sessions only:** subagent sessions are skipped. Two checks: opencode titles a subagent session `<description> (@<agent> subagent)` (the same signal the TUI uses), and structurally, any session with a parent session is skipped — which also covers child sessions whose titles don't match the convention (e.g. magic-context compartments). If the session cannot be resolved (e.g. an API hiccup), the plugin skips and logs a warning instead of staging at a wrong moment.
+- **No injected messages:** opencode plugins can inject user-role messages into a session via the server API (e.g. magic-context's progress notices and summary posts), and those fire `chat.message` too. The hook carries the message's parts inline, so the plugin skips staging synchronously when every part carries the `synthetic` or `ignored` flag (or when there are no parts to inspect) — real user input always has at least one unflagged text part.
+- **Dedup:** the same message ID only triggers once, and skipped messages never record into the dedup set, so injected messages cannot interfere with real turns.
 - **Guard:** runs only when a `.git` directory exists in the plugin's working directory (this includes jujutsu colocated working copies). Non-git directories are skipped.
 - **Action:** `git add .` in the working directory, without recursing into nested projects.
 
 ## Verification
 
-`scripts/verify.ts` covers 15 scenarios: main-session user message in a plain git repo → staged; subagent session (title ending in `(@agent subagent)`) → skipped; session lookup 404 / rejected → skipped without error; a magic-context-style injected message → skipped by the parts check regardless of session title; only `.jj` / neither → skipped; assistant `message.updated` → no-op; duplicate user message id → staged only once; unrelated event types → no-op. Injected-message detection is covered for synthetic-only parts, ignored-only parts, and real user input with plain text parts; a user-configured `skipSessionTitlePatterns` → skipped; messages lookup with parts never appearing / rejected → skipped without error. Run with:
+`scripts/verify.ts` covers 13 scenarios: main-session user message with real parts in a plain git repo → staged; subagent session title → skipped; session with a `parentID` (task-tool subagents, magic-context compartments) → skipped; session lookup 404 / rejected → skipped without error; only `.jj` → skipped; injected messages (synthetic-only parts, ignored-only parts, empty parts) → skipped; same message id fired twice → staged only once; a skipped synthetic message followed by a real message → still staged (dedup cannot be poisoned); user-configured `skipSessionTitlePatterns` → skipped; mixed synthetic + real parts → staged. Run with:
 
 ```sh
 bun scripts/verify.ts

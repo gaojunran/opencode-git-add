@@ -14,289 +14,202 @@ async function stagedFiles(dir: string): Promise<string[]> {
   return out.split("\n").filter(Boolean)
 }
 
-// Mock the opencode SDK client surface the plugin uses.
+// Mock the opencode SDK client surface the plugin uses. The chat.message
+// hook carries parts inline, so no messages lookup is needed anymore.
 type FakePart = { type: string; synthetic?: boolean; ignored?: boolean }
-type FakeMessage = { info: { id: string; sessionID?: string }; parts: FakePart[] }
 type FakeClient = {
   session: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    get: (args: any) => Promise<{ data?: { title?: string } }>
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    messages: (args: any) => Promise<{ data?: FakeMessage[] }>
+    get: (args: any) => Promise<{ data?: { title?: string; parentID?: string } }>
   }
   app: { log: () => Promise<void> }
 }
-function makeClient(
-  titleOr: string | "404" | "reject",
-  messages: FakeMessage[] = [],
-  emptyPartsFor?: string[],
-): FakeClient {
-  const allMessages: FakeMessage[] =
-    messages.length > 0
-      ? messages
-      : [{ info: { id: "msg-1", sessionID: "ses-main" }, parts: [{ type: "text", text: "user input" }] }]
+function makeClient(titleOr: string | "404" | "reject", parentID?: string): FakeClient {
   return {
     session: {
       get: async () => {
         if (titleOr === "404") return { data: undefined }
         if (titleOr === "reject") throw new Error("network down")
-        return { data: { title: titleOr } }
-      },
-      messages: async ({ path }: { path: { id: string } }) => {
-        const withEmpty = allMessages.map((m) => ({
-          ...m,
-          parts: emptyPartsFor?.includes(m.info.id) ? [] : m.parts,
-        }))
-        return { data: withEmpty.filter((m) => m.info.sessionID === path.id || !m.info.sessionID) }
+        return { data: { title: titleOr, parentID } }
       },
     },
     app: { log: async () => {} },
   }
 }
 
-function userMessage(id: string, sessionID = "ses-main") {
-  return {
-    event: {
-      type: "message.updated",
-      properties: { info: { id, sessionID, role: "user" } },
-    },
+type FakeInput = { sessionID: string }
+// One plugin instance per hook — the dedup Set lives in the instance.
+async function makeHook(dir: string, client: FakeClient, options?: Record<string, unknown>) {
+  const h = await GitAddOnNewTurn({ directory: dir, $: bun$, client: client as never }, options)
+  const hook = (h as { "chat.message"?: (input: FakeInput, output: { message: { id: string }; parts: FakePart[] }) => Promise<void> })[
+    "chat.message"
+  ]
+  if (!hook) throw new Error("plugin did not register a chat.message hook")
+  return async (parts: FakePart[], id = "msg-1") => {
+    await hook({ sessionID: "ses-main" }, { message: { id }, parts })
   }
 }
-
-async function fireTurn(dir: string, message: unknown, client: FakeClient, options?: Record<string, unknown>) {
-  const h = await GitAddOnNewTurn({ directory: dir, $: bun$, client: client as never }, options)
-  await h.event(message as never)
-  await Bun.sleep(200) // let async git add settle
-}
-
-async function scenario(
-  name: string,
-  setup: (d: string) => Promise<void>,
-  client: FakeClient = makeClient("my normal session"),
+async function fireTurn(
+  dir: string,
+  parts: FakePart[],
+  client: FakeClient,
   options?: Record<string, unknown>,
-) {
-  const dir = join(base, name)
-  await mkdir(dir, { recursive: true })
-  await setup(dir)
-  await fireTurn(dir, userMessage("msg-1"), client, options)
-  return dir
+  id = "msg-1",
+): Promise<void> {
+  const fire = await makeHook(dir, client, options)
+  await fire(parts, id)
 }
 
-// 1. main session, plain git repo -> staged
-const d1 = await scenario("git-only", async (d) => {
-  await bun$`git init -q ${d}`
-  await writeFile(join(d, "a.txt"), "hello")
-})
+const textPart = (text = "user input"): FakePart => ({ type: "text", text })
+
+// 1. main session, plain git repo, real user parts -> staged
+const d1 = join(base, "git-only")
+await mkdir(d1, { recursive: true })
+await bun$`git init -q ${d1}`
+await writeFile(join(d1, "a.txt"), "hello")
+await fireTurn(d1, [textPart()], makeClient("my normal session"))
 const staged1 = await stagedFiles(d1)
 const ok1 = staged1.includes("a.txt")
 
-// 2. subagent session -> NOT staged
-const d2 = await scenario(
-  "subagent",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("fix files (@fixer subagent)"),
-)
+// 2. subagent session title -> NOT staged
+const d2 = join(base, "subagent")
+await mkdir(d2, { recursive: true })
+await bun$`git init -q ${d2}`
+await writeFile(join(d2, "a.txt"), "hello")
+await fireTurn(d2, [textPart()], makeClient("fix files (@fixer subagent)"))
 const staged2 = await stagedFiles(d2)
 const ok2 = staged2.length === 0
 
-// 3. session lookup fails (404) -> skipped, no error
-const d3 = await scenario(
-  "lookup-404",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("404"),
-)
+// 3. session with a parentID (task-tool subagents, magic-context
+//    compartments) -> NOT staged even with a normal title
+const d3 = join(base, "child-session")
+await mkdir(d3, { recursive: true })
+await bun$`git init -q ${d3}`
+await writeFile(join(d3, "a.txt"), "hello")
+await fireTurn(d3, [textPart()], makeClient("magic-context-compartment", "ses-parent"))
 const staged3 = await stagedFiles(d3)
 const ok3 = staged3.length === 0
 
-// 4. session lookup rejects -> skipped, no error
-const d4 = await scenario(
-  "lookup-reject",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("reject"),
-)
+// 4. session lookup fails (404) -> skipped, no error
+const d4 = join(base, "lookup-404")
+await mkdir(d4, { recursive: true })
+await bun$`git init -q ${d4}`
+await writeFile(join(d4, "a.txt"), "hello")
+await fireTurn(d4, [textPart()], makeClient("404"))
 const staged4 = await stagedFiles(d4)
 const ok4 = staged4.length === 0
 
-// 5. no .git (jj only) -> skipped, no error
-await scenario("jj-only", async (d) => {
-  await mkdir(join(d, ".jj"))
-  await writeFile(join(d, "a.txt"), "hello")
-})
-const ok5 = true
+// 5. session lookup rejects -> skipped, no error
+const d5 = join(base, "lookup-reject")
+await mkdir(d5, { recursive: true })
+await bun$`git init -q ${d5}`
+await writeFile(join(d5, "a.txt"), "hello")
+await fireTurn(d5, [textPart()], makeClient("reject"))
+const staged5 = await stagedFiles(d5)
+const ok5 = staged5.length === 0
 
-// 6. assistant message.updated -> no-op
-await Bun.$`git -C ${d1} reset -q`
-await writeFile(join(d1, "a.txt"), "hello2")
-await fireTurn(
-  d1,
-  {
-    event: {
-      type: "message.updated",
-      properties: { info: { id: "asst-1", sessionID: "ses-main", role: "assistant" } },
-    },
-  },
-  makeClient("my normal session"),
-)
-const stagedAfterAssistant = await stagedFiles(d1)
-const ok6 = stagedAfterAssistant.length === 0
+// 6. no .git (jj only) -> skipped, no error
+const d6 = join(base, "jj-only")
+await mkdir(d6, { recursive: true })
+await mkdir(join(d6, ".jj"))
+await writeFile(join(d6, "a.txt"), "hello")
+await fireTurn(d6, [textPart()], makeClient("my normal session"))
+const ok6 = true
 
-// 7. duplicate user message id -> staged only once
-await Bun.$`git -C ${d1} reset -q`
-const h = await GitAddOnNewTurn({
-  directory: d1,
-  $: bun$,
-  client: makeClient("my normal session", [
-    { info: { id: "msg-dup", sessionID: "ses-main" }, parts: [{ type: "text", text: "duplicate" }] },
-  ]) as never,
-})
-await h.event(userMessage("msg-dup") as never)
-await Bun.sleep(200)
-await Bun.$`git -C ${d1} reset -q`
-await h.event(userMessage("msg-dup") as never)
-await Bun.sleep(200)
-const stagedAfterDup = await stagedFiles(d1)
-const ok7 = stagedAfterDup.length === 0
+// 7. synthetic-injected message -> NOT staged
+const d7 = join(base, "synthetic-injected")
+await mkdir(d7, { recursive: true })
+await bun$`git init -q ${d7}`
+await writeFile(join(d7, "a.txt"), "hello")
+await fireTurn(d7, [{ type: "text", text: "nudge", synthetic: true }], makeClient("my normal session"))
+const staged7 = await stagedFiles(d7)
+const ok7 = staged7.length === 0
 
-// 8. unrelated event type -> no-op
-await Bun.$`git -C ${d1} reset -q`
-await writeFile(join(d1, "a.txt"), "hello3")
-await fireTurn(
-  d1,
-  { event: { type: "session.idle", properties: {} } },
-  makeClient("my normal session"),
-)
-const stagedAfterWrongEvent = await stagedFiles(d1)
-const ok8 = stagedAfterWrongEvent.length === 0
+// 8. ignored-injected message -> NOT staged
+const d8 = join(base, "ignored-injected")
+await mkdir(d8, { recursive: true })
+await bun$`git init -q ${d8}`
+await writeFile(join(d8, "a.txt"), "hello")
+await fireTurn(d8, [{ type: "text", text: "notice", ignored: true }], makeClient("my normal session"))
+const staged8 = await stagedFiles(d8)
+const ok8 = staged8.length === 0
 
-// 9. magic-context child session title -> NOT staged only when the user
-// configures the pattern (no default prefix anymore; the injected-parts
-// check handles magic-context regardless of title)
-const d9 = await scenario(
-  "magic-context-title",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("magic-context-sidekick", [
-    { info: { id: "msg-1", sessionID: "ses-main" }, parts: [{ type: "text", text: "nudge", synthetic: true }] },
-  ]),
-)
+// 9. empty parts (nothing to inspect) -> NOT staged
+const d9 = join(base, "empty-parts")
+await mkdir(d9, { recursive: true })
+await bun$`git init -q ${d9}`
+await writeFile(join(d9, "a.txt"), "hello")
+await fireTurn(d9, [], makeClient("my normal session"))
 const staged9 = await stagedFiles(d9)
 const ok9 = staged9.length === 0
 
-// 10. synthetic-injected user message in main session -> NOT staged
-const d10 = await scenario(
-  "synthetic-injected",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("my normal session", [
-    { info: { id: "msg-1", sessionID: "ses-main" }, parts: [{ type: "text", text: "nudge", synthetic: true }] },
-  ]),
-)
+// 10. dedup: same message id fired twice on one instance -> staged only once
+const d10 = join(base, "dedup")
+await mkdir(d10, { recursive: true })
+await bun$`git init -q ${d10}`
+await writeFile(join(d10, "a.txt"), "hello")
+const fire10 = await makeHook(d10, makeClient("my normal session"))
+await fire10([textPart("first")], "msg-dup")
+const stagedFirst = await stagedFiles(d10)
+await bun$`git -C ${d10} reset -q`
+await fire10([textPart("again")], "msg-dup")
 const staged10 = await stagedFiles(d10)
-const ok10 = staged10.length === 0
+const ok10 = stagedFirst.includes("a.txt") && staged10.length === 0
 
-// 11. ignored-injected user message in main session -> NOT staged
-const d11 = await scenario(
-  "ignored-injected",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("my normal session", [
-    { info: { id: "msg-1", sessionID: "ses-main" }, parts: [{ type: "text", text: "notice", ignored: true }] },
-  ]),
-)
+// 11. skipped messages leave no trace: a synthetic message followed by a
+//     real one must still stage (the old single-slot dedup could be
+//     poisoned by skipped messages; the Set + record-after-checks cannot)
+const d11 = join(base, "synthetic-then-real")
+await mkdir(d11, { recursive: true })
+await bun$`git init -q ${d11}`
+await writeFile(join(d11, "a.txt"), "hello")
+const fire11 = await makeHook(d11, makeClient("my normal session"))
+await fire11([{ type: "text", text: "⚠️ Magic Context", synthetic: true }], "msg-synth")
+await fire11([textPart("real turn")], "msg-real")
 const staged11 = await stagedFiles(d11)
-const ok11 = staged11.length === 0
+const ok11 = staged11.includes("a.txt")
 
-// 12. real user message with a plain text part -> staged
-const d12 = await scenario(
-  "real-user-with-parts",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("my normal session", [
-    { info: { id: "msg-1", sessionID: "ses-main" }, parts: [{ type: "text", text: "please fix" }] },
-  ]),
-)
+// 12. user-configured extra title pattern -> NOT staged
+const d12 = join(base, "custom-title-pattern")
+await mkdir(d12, { recursive: true })
+await bun$`git init -q ${d12}`
+await writeFile(join(d12, "a.txt"), "hello")
+await fireTurn(d12, [textPart()], makeClient("my-journal-session"), { skipSessionTitlePatterns: ["^my-journal-"] })
 const staged12 = await stagedFiles(d12)
-const ok12 = staged12.includes("a.txt")
+const ok12 = staged12.length === 0
 
-// 13. user-configured extra title pattern -> NOT staged
-const d13 = await scenario(
-  "custom-title-pattern",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("my-journal-session"),
-  { skipSessionTitlePatterns: ["^my-journal-"] },
+// 13. mixed parts: one synthetic + one real text part -> staged
+//     (real user input always has at least one unflagged text part)
+const d13 = join(base, "mixed-parts")
+await mkdir(d13, { recursive: true })
+await bun$`git init -q ${d13}`
+await writeFile(join(d13, "a.txt"), "hello")
+await fireTurn(
+  d13,
+  [
+    { type: "text", text: "injected note", synthetic: true },
+    textPart("please fix"),
+  ],
+  makeClient("my normal session"),
 )
 const staged13 = await stagedFiles(d13)
-const ok13 = staged13.length === 0
-
-// 14. message parts never appear (lookup exhausted) -> skipped, no error
-const d14 = await scenario(
-  "parts-never-arrive",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  makeClient("my normal session", [], ["msg-1"]),
-)
-const staged14 = await stagedFiles(d14)
-const ok14 = staged14.length === 0
-
-// 15. messages lookup rejects -> skipped, no error
-const d15 = await scenario(
-  "messages-reject",
-  async (d) => {
-    await bun$`git init -q ${d}`
-    await writeFile(join(d, "a.txt"), "hello")
-  },
-  {
-    session: {
-      get: async () => ({ data: { title: "my normal session" } }),
-      messages: async () => {
-        throw new Error("network down")
-      },
-    },
-    app: { log: async () => {} },
-  },
-)
-const staged15 = await stagedFiles(d15)
-const ok15 = staged15.length === 0
+const ok13 = staged13.includes("a.txt")
 
 console.log("1. main session staged:", ok1, staged1)
-console.log("2. subagent session skipped:", ok2)
-console.log("3. lookup 404 skipped:", ok3)
-console.log("4. lookup reject skipped:", ok4)
-console.log("5. jj-only skipped:", ok5)
-console.log("6. assistant message no-op:", ok6)
-console.log("7. duplicate message dedup:", ok7)
-console.log("8. unrelated event no-op:", ok8)
-console.log("9. magic-context title skipped:", ok9)
-console.log("10. synthetic-injected skipped:", ok10)
-console.log("11. ignored-injected skipped:", ok11)
-console.log("12. real user with parts staged:", ok12)
-console.log("13. custom title pattern skipped:", ok13)
-console.log("14. parts never arrive skipped:", ok14)
-console.log("15. messages lookup reject skipped:", ok15)
+console.log("2. subagent title skipped:", ok2)
+console.log("3. parentID child session skipped:", ok3)
+console.log("4. lookup 404 skipped:", ok4)
+console.log("5. lookup reject skipped:", ok5)
+console.log("6. jj-only skipped:", ok6)
+console.log("7. synthetic-injected skipped:", ok7)
+console.log("8. ignored-injected skipped:", ok8)
+console.log("9. empty parts skipped:", ok9)
+console.log("10. dedup fires once:", ok10)
+console.log("11. skipped messages cannot poison dedup:", ok11)
+console.log("12. custom title pattern skipped:", ok12)
+console.log("13. mixed parts staged:", ok13)
 
-if (!ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 || !ok8 || !ok9 || !ok10 || !ok11 || !ok12 || !ok13 || !ok14 || !ok15) {
+if (!ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 || !ok8 || !ok9 || !ok10 || !ok11 || !ok12 || !ok13) {
   failures++
 }
 
