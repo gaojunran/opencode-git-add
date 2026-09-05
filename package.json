@@ -1,6 +1,6 @@
 {
   "name": "opencode-git-add",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "opencode plugin: git add . at the start of each main-session turn (subagent turns skipped), so the unstaged diff always shows only the in-progress turn's changes",
   "main": "git-add.ts",
   "module": "git-add.ts",

@@ -9,10 +9,6 @@ async function journal(line: string) {
   await appendFile(LOGFILE, `${new Date().toISOString()} ${line}\n`).catch(() => {})
 }
 
-// Subagent sessions are titled "<description> (@<agent> subagent)" by
-// opencode's task tool — same signal the TUI uses to detect them.
-const SUBAGENT_TITLE = /@[\w-]+ subagent\)?$/i
-
 // Dedup memory for message ids we already staged. The chat.message hook
 // fires exactly once per submission, so this is belt-and-suspenders — but it
 // costs nothing and guards against future core changes. Ids are recorded
@@ -24,10 +20,10 @@ const STAGED_ID_LIMIT = 500
 export interface GitAddOnNewTurnOptions {
   /**
    * Session titles matching any of these regexes are skipped (no git add).
-   * This is only needed for sessions the injected-message check below cannot
-   * see into; every known injected-message source (magic-context, slim and
-   * opencode's own task machinery) marks its parts synthetic/ignored and is
-   * already skipped by that check. Empty by default.
+   * Built-in subagent/injected-message skipping is structural and does not
+   * rely on titles — child sessions are detected via their parentID in the
+   * session DB, and injected messages via their synthetic/ignored parts — so
+   * this option is only for your own title-based rules. Empty by default.
    */
   skipSessionTitlePatterns?: string[]
 }
@@ -88,19 +84,22 @@ export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?
       // Skip subagent turns: only real user turns in the main session should
       // trigger staging, otherwise staging happens mid-turn whenever the main
       // agent spawns a subagent (the task tool prompts the child session, and
-      // chat.message fires there too). Two checks: the title convention, and
-      // structurally, any session with a parent — which also covers sessions
-      // like magic-context compartments whose titles don't match the
-      // convention. When the session cannot be resolved, skip rather than
-      // risk staging at the wrong moment.
+      // chat.message fires there too). A session is a subagent when it has a
+      // parentID in the session DB — a purely structural signal that also
+      // covers child sessions like magic-context compartments, whose titles
+      // never follow a convention. Earlier versions also skipped sessions
+      // whose title matched "<description> (@<agent> subagent)"; that check
+      // is redundant and gone, because the session store contains no
+      // subagent session without a parentID. When the session cannot be
+      // resolved, skip rather than risk staging at the wrong moment.
       const reply = await client.session
         .get({ path: { id: sessionID } })
         .catch(async (e: unknown) => {
           await journal(`session.get failed: ${String(e)}`)
           return undefined
         })
-      const title = reply?.data?.title
-      if (!title) {
+      const data = reply?.data
+      if (!data) {
         await client.app
           .log({
             body: {
@@ -110,21 +109,17 @@ export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?
             },
           })
           .catch(() => {})
-        await journal(`skip: no session title for ${sessionID}`)
+        await journal(`skip: no session data for ${sessionID}`)
         return
       }
-      if (SUBAGENT_TITLE.test(title)) {
-        await journal(`skip: subagent session "${title}"`)
-        return
-      }
-      const parentID = (reply?.data as { parentID?: string } | undefined)?.parentID
+      const parentID = (data as { parentID?: string }).parentID
       if (parentID) {
-        await journal(`skip: child session "${title}" (parent=${parentID})`)
+        await journal(`skip: child session "${data.title ?? sessionID}" (parent=${parentID})`)
         return
       }
       for (const pattern of skipSessionTitle) {
-        if (pattern.test(title)) {
-          await journal(`skip: session title "${title}" matches ${pattern}`)
+        if (pattern.test(data.title ?? "")) {
+          await journal(`skip: session title "${data.title}" matches ${pattern}`)
           return
         }
       }

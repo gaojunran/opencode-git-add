@@ -71,14 +71,17 @@ await fireTurn(d1, [textPart()], makeClient("my normal session"))
 const staged1 = await stagedFiles(d1)
 const ok1 = staged1.includes("a.txt")
 
-// 2. subagent session title -> NOT staged
-const d2 = join(base, "subagent")
+// 2. subagent-style title WITHOUT a parentID -> staged. Child sessions are
+//    detected structurally via the session-DB parentID, and no real session
+//    carries a subagent title without one — so the old title-convention check
+//    is gone. This guards against it silently coming back.
+const d2 = join(base, "title-no-parent")
 await mkdir(d2, { recursive: true })
 await bun$`git init -q ${d2}`
 await writeFile(join(d2, "a.txt"), "hello")
 await fireTurn(d2, [textPart()], makeClient("fix files (@fixer subagent)"))
 const staged2 = await stagedFiles(d2)
-const ok2 = staged2.length === 0
+const ok2 = staged2.includes("a.txt")
 
 // 3. session with a parentID (task-tool subagents, magic-context
 //    compartments) -> NOT staged even with a normal title
@@ -196,7 +199,7 @@ const staged13 = await stagedFiles(d13)
 const ok13 = staged13.includes("a.txt")
 
 console.log("1. main session staged:", ok1, staged1)
-console.log("2. subagent title skipped:", ok2)
+console.log("2. subagent-style title w/o parentID staged:", ok2)
 console.log("3. parentID child session skipped:", ok3)
 console.log("4. lookup 404 skipped:", ok4)
 console.log("5. lookup reject skipped:", ok5)
