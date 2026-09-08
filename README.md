@@ -78,10 +78,11 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 - **Dedup:** the same message ID only triggers once, and skipped messages never record into the dedup set, so injected messages cannot interfere with real turns.
 - **Guard:** runs only when a `.git` directory exists in the plugin's working directory (this includes jujutsu colocated working copies). Non-git directories are skipped.
 - **Action:** `git add .` in the working directory, without recursing into nested projects.
+- **Never blocks your message:** staging is a convenience, not a gate. If `git add .` fails (most commonly a concurrent git process holding `.git/index.lock`, which exits 128), the plugin retries up to 3 times with 500ms between attempts, then reports a warning and lets the turn proceed anyway — a transient git failure can never kill your submitted message. The failing git stderr is journaled for diagnosis (see Debugging).
 
 ## Verification
 
-`scripts/verify.ts` covers 13 scenarios: main-session user message with real parts in a plain git repo → staged; subagent-style session title without a `parentID` → still staged (only the session-DB `parentID` classifies a child session); session with a `parentID` (task-tool subagents, magic-context compartments) → skipped; session lookup 404 / rejected → skipped without error; only `.jj` → skipped; injected messages (synthetic-only parts, ignored-only parts, empty parts) → skipped; same message id fired twice → staged only once; a skipped synthetic message followed by a real message → still staged (dedup cannot be poisoned); user-configured `skipSessionTitlePatterns` → skipped; mixed synthetic + real parts → staged. Run with:
+`scripts/verify.ts` covers 14 scenarios: main-session user message with real parts in a plain git repo → staged; subagent-style session title without a `parentID` → still staged (only the session-DB `parentID` classifies a child session); session with a `parentID` (task-tool subagents, magic-context compartments) → skipped; session lookup 404 / rejected → skipped without error; only `.jj` → skipped; injected messages (synthetic-only parts, ignored-only parts, empty parts) → skipped; same message id fired twice → staged only once; a skipped synthetic message followed by a real message → still staged (dedup cannot be poisoned); user-configured `skipSessionTitlePatterns` → skipped; mixed synthetic + real parts → staged; `git add .` failing while `.git/index.lock` is held → hook retries, does not throw, stages nothing, and a later turn stages normally once the lock is gone. Run with:
 
 ```sh
 bun scripts/verify.ts
@@ -93,6 +94,8 @@ MIT
 ## Debugging
 
 The hook journals every event it sees and the decision taken to
-`/tmp/opencode-git-add.log` (append-only, safe to leave on). When reporting a
-misbehaviour, include that file — it shows exactly which events fired, in what
-order, and whether staging ran.
+`/tmp/opencode-git-add.log` (append-only, safe to leave on). When a staging
+failure is retried, the failing attempt count, exit code and **git stderr**
+are journaled too. When reporting a misbehaviour, include that file — it
+shows exactly which events fired, in what order, whether staging ran, and
+why it failed.

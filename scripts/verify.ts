@@ -1,4 +1,4 @@
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises"
+import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { $ as bun$ } from "bun"
@@ -198,6 +198,31 @@ await fireTurn(
 const staged13 = await stagedFiles(d13)
 const ok13 = staged13.includes("a.txt")
 
+// 14. git add failure (a concurrent process holding .git/index.lock) must
+//     not block the message: the hook retries, does not throw, journals the
+//     failing stderr, and a later turn stages normally once the lock is gone.
+const d14 = join(base, "staging-failure")
+await mkdir(d14, { recursive: true })
+await bun$`git init -q ${d14}`
+await writeFile(join(d14, "a.txt"), "hello")
+await writeFile(join(d14, ".git/index.lock"), "held by another process")
+const fire14 = await makeHook(d14, makeClient("my normal session"))
+let ok14 = true
+try {
+  await fire14([textPart("turn during lock")], "msg-locked")
+} catch {
+  ok14 = false
+}
+const stagedDuringLock = await stagedFiles(d14)
+const journalText = await readFile("/tmp/opencode-git-add.log", "utf8").catch(() => "")
+const d14Lines = journalText.split("\n").filter((line) => line.includes(`dir=${d14}`))
+const d14Attempts = d14Lines.filter((line) => line.includes("git add attempt")).length
+const stderrCaptured = d14Lines.some((line) => line.includes("index.lock"))
+await rm(join(d14, ".git/index.lock"))
+await fire14([textPart("turn after lock")], "msg-after-lock")
+const staged14 = await stagedFiles(d14)
+const ok14b = ok14 && stagedDuringLock.length === 0 && d14Attempts === 3 && stderrCaptured && staged14.includes("a.txt")
+
 console.log("1. main session staged:", ok1, staged1)
 console.log("2. subagent-style title w/o parentID staged:", ok2)
 console.log("3. parentID child session skipped:", ok3)
@@ -211,8 +236,12 @@ console.log("10. dedup fires once:", ok10)
 console.log("11. skipped messages cannot poison dedup:", ok11)
 console.log("12. custom title pattern skipped:", ok12)
 console.log("13. mixed parts staged:", ok13)
+console.log("14. git add failure retries without blocking:", ok14, ok14b, `attempts=${d14Attempts} stderrCaptured=${stderrCaptured}`)
 
-if (!ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 || !ok8 || !ok9 || !ok10 || !ok11 || !ok12 || !ok13) {
+if (
+  !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 || !ok8 || !ok9 || !ok10 || !ok11 || !ok12 ||
+  !ok13 || !ok14 || !ok14b
+) {
   failures++
 }
 

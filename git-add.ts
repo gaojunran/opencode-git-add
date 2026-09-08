@@ -1,6 +1,6 @@
 import { access, appendFile } from "node:fs/promises"
 import { join } from "node:path"
-import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
+import type { Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 
 // Debug journal: every event the hook sees, with the decision taken.
 // Safe to leave on; it only appends a few lines per event to a /tmp file.
@@ -49,6 +49,32 @@ function isInjected(parts: PartWithFlags[]): boolean {
 // re-broadcasts that event whenever it recomputes a message's diff summary,
 // and plugin-injected synthetic messages broadcast it too — the two combined
 // into spurious mid-turn staging (fixed in v0.7.0; see README).
+// Staging is a convenience, not a gate: git failures (most commonly a
+// concurrent process holding .git/index.lock, which exits 128) must never
+// kill the user's message. Retry briefly for lock contention, then give up,
+// journal the real stderr and let the turn proceed.
+const STAGING_ATTEMPTS = 3
+const STAGING_RETRY_DELAY_MS = 500
+
+async function stageChanges(
+  $: PluginInput["$"],
+  directory: string,
+  messageID: string,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= STAGING_ATTEMPTS; attempt++) {
+    const proc = await $`git add .`.cwd(directory).nothrow().quiet()
+    if (proc.exitCode === 0) return true
+    const stderr = proc.stderr.toString().trim()
+    await journal(
+      `git add attempt ${attempt}/${STAGING_ATTEMPTS} failed (dir=${directory}) exit=${proc.exitCode} stderr=${stderr} id=${messageID}`,
+    )
+    if (attempt < STAGING_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, STAGING_RETRY_DELAY_MS))
+    }
+  }
+  return false
+}
+
 export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?: PluginOptions) => {
   const stagedMessageIDs = new Set<string>()
 
@@ -139,7 +165,18 @@ export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?
 
       await journal(`git add . (dir=${directory})`)
 
-      await $`git add .`.cwd(directory).quiet()
+      const staged = await stageChanges($, directory, id)
+      if (!staged) {
+        await client.app
+          .log({
+            body: {
+              service: "opencode-git-add",
+              level: "warn",
+              message: `git add . failed after ${STAGING_ATTEMPTS} attempts in ${directory}; continuing without staging`,
+            },
+          })
+          .catch(() => {})
+      }
     },
   }
 }
