@@ -2,7 +2,7 @@
 
 An [opencode](https://opencode.ai) plugin that freezes the previous turn's agent changes out of the unstaged diff at the start of every new conversation turn, so the unstaged diff always shows only the in-progress turn's changes.
 
-- **opencode 2.x (v2 lane):** stages **exactly the files agent tools touched** since the last turn — `git add -- <paths>` per project directory, tracked from `write`/`edit` tool calls across all sessions (main and subagent).
+- **opencode 2.x (v2 lane):** stages **exactly the files agent tools touched** since the last turn — `git add -- <paths>` per project directory, tracked from `write`/`edit`/`apply_patch` tool calls across all sessions (main and subagent).
 - **opencode 1.x (v1 lane):** stages everything (`git add .`) at the start of each main-session turn, as in v0.9.0.
 
 ## Motivation
@@ -34,15 +34,14 @@ The 2.x host activates plugins through the module's **default export** — an ob
 
 Two hooks drive the v2 lane:
 
-- **Track** — `context.tool.hook("execute.after", ...)`: after every completed `write`/`edit` tool call (in any session, subagent included), the file path from the tool input (`input.path`, relative or absolute) is recorded in a per-project-directory set. Drafts whose `status` is present and not `"completed"` are ignored, as are paths resolving outside the project directory.
+- **Track** — `context.tool.hook("execute.after", ...)`: after every completed `write`/`edit`/`apply_patch` tool call (in any session, subagent included), the touched file paths are recorded in a per-project-directory set. `write`/`edit` contribute `input.path` (relative or absolute); `apply_patch` contributes the result-metadata files list when the host forwards it (`result.metadata.files[].filePath`, authoritative) and otherwise the paths parsed from the patch-text file headers (`*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Rename File: <a> to <b>` / `*** Move to:` — rename forms count both the old and the new path). Drafts whose `status` is present and not `"completed"` are ignored, as are paths resolving outside the project directory.
 - **Stage** — `context.session.hook("prompt", ...)`: fires once per real user prompt submission, before any tool runs. If the current main session's directory has a non-empty tracked set, the plugin runs `git add -- <paths>` (a single pathspec-limited command — this also stages deletions of now-missing files), then clears the set. If the set is empty, nothing runs at all.
 
 Guards on the v2 lane (mirroring the v1 lane): the session is resolved via `context.session.get({ sessionID })` and staging is skipped for child sessions (any session with a `parentID`, e.g. subagents spawned by the task tool — their own prompts never stage) and for sessions whose title matches a configured pattern; the `.git` existence check applies per session directory; and the same message id only ever triggers once. Staging never kills your message: git failures (most commonly `.git/index.lock` contention, exit 128) are retried 3 times with 500ms between attempts, then reported and the turn proceeds anyway.
 
-Two documented limitations of precise (path-tracked) staging:
+One documented limitation of precise (path-tracked) staging:
 
-- **bash write is invisible.** Any file changed through a `bash` tool call (or any non-`write`/`edit` tool) is not tracked and will not be staged by the next turn — the per-turn boundary then simply does not apply to that file until a later `write`/`edit` touches it.
-- **`apply_patch` is invisible.** Its tool input carries only the patch text, no path field, so nothing can be tracked from it (same reason as bash).
+- **bash write is invisible.** Any file changed through a `bash` tool call (or any non-`write`/`edit`/`apply_patch` tool) is not tracked and will not be staged by the next turn — the per-turn boundary then simply does not apply to that file until a later `write`/`edit`/`apply_patch` touches it.
 
 Injected messages are not an issue on this lane: the host fires the `prompt` hook only for real submissions. Plugin injections via `context.session.synthetic` (how magic-context posts its nudges) do **not** fire the hook (live-verified on 2.0.21), and explicit `context.session.prompt` submissions are indistinguishable from a user prompt by design — exactly like an unflagged API submission on the v1 lane.
 
@@ -98,7 +97,7 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 ### v2 lane (opencode 2.x) — precise tool-tracked staging
 
 - **Trigger:** the `prompt` hook — fires once per user prompt submission, before the message is processed and before any tool runs (live-verified on 2.0.21).
-- **Tracked writes:** `write`/`edit` tool calls from **every** session in the project directory, subagents included. The set is drained only by a **main-session** prompt (`parentID` absent), so a subagent's writes are staged by the next main-session turn — never mid-turn.
+- **Tracked writes:** `write`/`edit`/`apply_patch` tool calls from **every** session in the project directory, subagents included. (`apply_patch` paths come from the result metadata files when the host forwards them, else from the patch-text file headers — see above.) The set is drained only by a **main-session** prompt (`parentID` absent), so a subagent's writes are staged by the next main-session turn — never mid-turn.
 - **Precision:** `git add -- <paths>` — only files the tools actually touched are ever staged; a `git add .` never runs. Files you edited yourself in the working tree stay unstaged.
 - **Empty turns stage nothing:** if no tracked writes accumulated since the last staging, the prompt hook returns without running git at all.
 - **Dedup:** the same message ID only triggers once.
@@ -116,10 +115,10 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 
 ## Verification
 
-`scripts/verify.ts` covers 25 scenarios with real git repositories:
+`scripts/verify.ts` covers 29 scenarios with real git repositories:
 
 - v1 lane (1–14): main-session user message with real parts in a plain git repo → staged; subagent-style session title without a `parentID` → still staged; session with a `parentID` → skipped; session lookup 404 / rejected → skipped without error; only `.jj` → skipped; injected messages (synthetic-only, ignored-only, empty parts) → skipped; same message id fired twice → staged only once; a skipped synthetic message followed by a real one → still staged (dedup cannot be poisoned); user-configured `skipSessionTitlePatterns` → skipped; mixed synthetic + real parts → staged; `git add .` failing while `.git/index.lock` is held → retries, does not throw, and a later turn stages normally.
-- v2 lane (15–25): a `write` tracked from a main session is staged by the next prompt **exactly** (a manually edited file is never staged); a subagent's `edit` with an absolute path is tracked, the child's own prompt does not stage, the next main prompt does; a turn with no tracked writes stages nothing; a tool draft with `status` ≠ `"completed"` is not tracked; a path resolving outside the project is not tracked; `apply_patch` (no path field) is not tracked; message-id dedup; title-pattern option via `context.options`; session lookup failure skips without error; no `.git` skips without error; staging failure with a held `index.lock` retries 3 times without throwing, and a later prompt stages normally.
+- v2 lane (15–29): a `write` tracked from a main session is staged by the next prompt **exactly** (a manually edited file is never staged); a subagent's `edit` with an absolute path is tracked, the child's own prompt does not stage, the next main prompt does; a turn with no tracked writes stages nothing; a tool draft with `status` ≠ `"completed"` is not tracked; a path resolving outside the project is not tracked; `apply_patch` patch-text headers are tracked and staged exactly; `apply_patch` with all header forms (update/add/delete/rename-file/move-to — old and new rename sides included); garbage `patchText` (no parseable headers) is not tracked; empty result metadata falls back to `patchText` (journaled `src=patchText`); result metadata files are authoritative over header parsing (journaled `src=metadata`); message-id dedup; title-pattern option via `context.options`; session lookup failure skips without error; no `.git` skips without error; staging failure with a held `index.lock` retries 3 times without throwing, and a later prompt stages normally.
 
 Run with:
 
