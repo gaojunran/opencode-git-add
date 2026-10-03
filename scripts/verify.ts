@@ -1,4 +1,4 @@
-import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises"
+import { mkdtemp, rm, mkdir, writeFile, readFile, rename } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { $ as bun$ } from "bun"
@@ -10,7 +10,10 @@ const base = await mkdtemp(join(tmpdir(), "hook-test-"))
 let failures = 0
 
 async function stagedFiles(dir: string): Promise<string[]> {
-  const out = await bun$`git -C ${dir} diff --cached --name-only`.quiet().text()
+  // diff.renames=false: report the raw pathspec-level result. Rename
+  // detection would collapse deletions+additions of identical-content files
+  // into a single "new name" line, hiding staged deletions.
+  const out = await bun$`git -C ${dir} -c diff.renames=false diff --cached --name-only`.quiet().text()
   return out.split("\n").filter(Boolean)
 }
 
@@ -352,17 +355,25 @@ await firePrompt(ctx19, { sessionID: "ses-main", messageID: "msg-19", prompt: { 
 const staged19 = await stagedFiles(d19)
 const ok19 = staged19.length === 0
 
-// 20. apply_patch input has no path field -> untracked, nothing staged
+// 20. apply_patch patchText `*** Update File:` header -> tracked, staged
+//     exactly (since v0.10.1; pre-0.10.1 it was untracked)
 const d20 = join(base, "v2-apply-patch")
 await mkdir(d20, { recursive: true })
 await bun$`git init -q ${d20}`
-await writeFile(join(d20, "a.txt"), "hello")
+await writeFile(join(d20, "notes.txt"), "hello")
+await bun$`git -C ${d20} add notes.txt && git -C ${d20} commit -qm init`
 const ctx20 = await v2Setup(d20)
 ctx20.sessions.set("ses-main", { title: "main" })
-await afterTool(ctx20, { sessionID: "ses-main", tool: "apply_patch", input: { patchText: "*** Begin Patch***" }, status: "completed" })
+await afterTool(ctx20, {
+  sessionID: "ses-main",
+  tool: "apply_patch",
+  input: { patchText: "*** Begin Patch\n*** Update File: notes.txt\n@@ MARKER\n+MARKER-16\n*** End Patch" },
+  status: "completed",
+})
+await writeFile(join(d20, "notes.txt"), "hello\nMARKER-16")
 await firePrompt(ctx20, { sessionID: "ses-main", messageID: "msg-20", prompt: { text: "go" } })
 const staged20 = await stagedFiles(d20)
-const ok20 = staged20.length === 0
+const ok20 = staged20.length === 1 && staged20[0] === "notes.txt"
 
 // 21. dedup: same message id fired twice on one instance -> staged only once
 const d21 = join(base, "v2-dedup")
@@ -440,6 +451,127 @@ await firePrompt(ctx25, { sessionID: "ses-main", messageID: "msg-after-lock", pr
 const staged25 = await stagedFiles(d25)
 const ok25b = ok25 && stagedDuringLock25.length === 0 && d25Attempts === 3 && staged25.includes("a.txt")
 
+// 26. apply_patch patchText with every header form (update/add/delete/
+//     rename/move-to) -> all touched paths staged, old AND new sides of
+//     renames included
+const d26 = join(base, "v2-apply-patch-headers")
+await mkdir(d26, { recursive: true })
+await bun$`git init -q ${d26}`
+for (const f of ["upd.txt", "del.txt", "ren.txt", "mov.txt"]) {
+  await writeFile(join(d26, f), "a")
+}
+await bun$`git -C ${d26} add -A && git -C ${d26} commit -qm init`
+const ctx26 = await v2Setup(d26)
+ctx26.sessions.set("ses-main", { title: "main" })
+const patch26 = [
+  "*** Begin Patch",
+  "*** Update File: upd.txt",
+  "+b",
+  "*** Add File: new.txt",
+  "+n",
+  "*** Delete File: del.txt",
+  "*** Rename File: ren.txt to ren2.txt",
+  "*** Update File: mov.txt",
+  "*** Move to: mov2.txt",
+  "*** End Patch",
+].join("\n")
+await afterTool(ctx26, {
+  sessionID: "ses-main",
+  tool: "apply_patch",
+  input: { patchText: patch26 },
+  status: "completed",
+})
+// mirror the patch in the worktree
+await writeFile(join(d26, "upd.txt"), "ab")
+await writeFile(join(d26, "new.txt"), "n")
+await rm(join(d26, "del.txt"))
+await rename(join(d26, "ren.txt"), join(d26, "ren2.txt"))
+await writeFile(join(d26, "mov2.txt"), "a")
+await rm(join(d26, "mov.txt"))
+await firePrompt(ctx26, { sessionID: "ses-main", messageID: "msg-26", prompt: { text: "go" } })
+const staged26 = await stagedFiles(d26)
+const ok26 =
+  ["upd.txt", "new.txt", "del.txt", "ren.txt", "ren2.txt", "mov.txt", "mov2.txt"].every((f) =>
+    staged26.includes(f),
+  ) && staged26.length === 7
+
+// 27. garbage patchText (no parseable file headers — bogus op, empty path,
+//     bare content) -> nothing tracked, nothing staged
+const d27 = join(base, "v2-apply-patch-garbage")
+await mkdir(d27, { recursive: true })
+await bun$`git init -q ${d27}`
+await writeFile(join(d27, "a.txt"), "hello")
+const ctx27 = await v2Setup(d27)
+ctx27.sessions.set("ses-main", { title: "main" })
+await afterTool(ctx27, {
+  sessionID: "ses-main",
+  tool: "apply_patch",
+  input: {
+    patchText: [
+      "*** Begin Patch",
+      "*** Bogus Op: sneaky.txt",
+      "*** Update File: ",
+      "just some content",
+      "*** End Patch",
+    ].join("\n"),
+  },
+  status: "completed",
+})
+await firePrompt(ctx27, { sessionID: "ses-main", messageID: "msg-27", prompt: { text: "go" } })
+const staged27 = await stagedFiles(d27)
+const ok27 = staged27.length === 0
+
+// 28. empty result metadata (files: []) -> falls back to patchText headers
+//     (journaled with src=patchText)
+const d28 = join(base, "v2-apply-patch-empty-meta")
+await mkdir(d28, { recursive: true })
+await bun$`git init -q ${d28}`
+await writeFile(join(d28, "notes.txt"), "hello")
+await bun$`git -C ${d28} add notes.txt && git -C ${d28} commit -qm init`
+const ctx28 = await v2Setup(d28)
+ctx28.sessions.set("ses-main", { title: "main" })
+await afterTool(ctx28, {
+  sessionID: "ses-main",
+  tool: "apply_patch",
+  input: { patchText: "*** Begin Patch\n*** Update File: notes.txt\n+x\n*** End Patch" },
+  result: { metadata: { files: [] } },
+  status: "completed",
+})
+await writeFile(join(d28, "notes.txt"), "hello\nx")
+await firePrompt(ctx28, { sessionID: "ses-main", messageID: "msg-28", prompt: { text: "go" } })
+const staged28 = await stagedFiles(d28)
+const v2Journal28 = await readFile("/tmp/opencode-git-add.log", "utf8").catch(() => "")
+const ok28 =
+  staged28.length === 1 &&
+  staged28[0] === "notes.txt" &&
+  v2Journal28.split("\n").some((l) => l.includes(`dir=${d28}`) && l.includes("src=patchText"))
+
+// 29. result metadata files are authoritative: the metadata filePath
+//     (absolute) is tracked with src=metadata, and the patchText headers
+//     are NOT parsed when metadata is present (ghost.txt must not be staged)
+const d29 = join(base, "v2-apply-patch-metadata")
+await mkdir(d29, { recursive: true })
+await bun$`git init -q ${d29}`
+await writeFile(join(d29, "meta.txt"), "hello")
+await bun$`git -C ${d29} add meta.txt && git -C ${d29} commit -qm init`
+const ctx29 = await v2Setup(d29)
+ctx29.sessions.set("ses-main", { title: "main" })
+await afterTool(ctx29, {
+  sessionID: "ses-main",
+  tool: "apply_patch",
+  input: { patchText: "*** Begin Patch\n*** Update File: ghost.txt\n+x\n*** End Patch" },
+  result: { metadata: { files: [{ filePath: join(d29, "meta.txt") }] } },
+  status: "completed",
+})
+await writeFile(join(d29, "meta.txt"), "hello\nx")
+await firePrompt(ctx29, { sessionID: "ses-main", messageID: "msg-29", prompt: { text: "go" } })
+const staged29 = await stagedFiles(d29)
+const v2Journal29 = await readFile("/tmp/opencode-git-add.log", "utf8").catch(() => "")
+const ok29 =
+  staged29.length === 1 &&
+  staged29[0] === "meta.txt" &&
+  v2Journal29.split("\n").some((l) => l.includes(`dir=${d29}`) && l.includes("src=metadata"))
+
 console.log("1. main session staged:", ok1, staged1)
 console.log("2. subagent-style title w/o parentID staged:", ok2)
 console.log("3. parentID child session skipped:", ok3)
@@ -459,17 +591,21 @@ console.log("16. v2 subagent edit (abs path) tracked; child prompt skipped; main
 console.log("17. v2 no tracked writes -> nothing staged:", ok17)
 console.log("18. v2 non-completed tool status not tracked:", ok18)
 console.log("19. v2 outside-project path not tracked:", ok19)
-console.log("20. v2 apply_patch (no path field) not tracked:", ok20)
+console.log("20. v2 apply_patch patchText header tracked, staged next prompt:", ok20, staged20)
 console.log("21. v2 dedup fires once:", ok21)
 console.log("22. v2 custom title pattern skipped:", ok22)
 console.log("23. v2 session lookup failure skipped:", ok23)
 console.log("24. v2 no .git skipped:", ok24)
 console.log("25. v2 staging failure retries without blocking:", ok25, ok25b, `attempts=${d25Attempts}`)
+console.log("26. v2 apply_patch all header forms (update/add/delete/rename/move-to):", ok26)
+console.log("27. v2 apply_patch garbage patchText not tracked:", ok27)
+console.log("28. v2 apply_patch empty metadata falls back to patchText:", ok28)
+console.log("29. v2 apply_patch metadata files authoritative (src=metadata):", ok29)
 
 if (
   !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 || !ok8 || !ok9 || !ok10 || !ok11 || !ok12 ||
   !ok13 || !ok14 || !ok14b || !ok15 || !ok16 || !ok17 || !ok18 || !ok19 || !ok20 || !ok21 || !ok22 ||
-  !ok23 || !ok24 || !ok25 || !ok25b
+  !ok23 || !ok24 || !ok25 || !ok25b || !ok26 || !ok27 || !ok28 || !ok29
 ) {
   failures++
 }
