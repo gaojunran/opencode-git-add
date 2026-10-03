@@ -1,5 +1,6 @@
 import { access, appendFile } from "node:fs/promises"
-import { join } from "node:path"
+import { execFile } from "node:child_process"
+import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import type { Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 
 // Debug journal: every event the hook sees, with the decision taken.
@@ -9,12 +10,12 @@ async function journal(line: string) {
   await appendFile(LOGFILE, `${new Date().toISOString()} ${line}\n`).catch(() => {})
 }
 
-// Dedup memory for message ids we already staged. The chat.message hook
-// fires exactly once per submission, so this is belt-and-suspenders — but it
-// costs nothing and guards against future core changes. Ids are recorded
-// only AFTER every skip check passes, so skipped messages can never poison
-// the dedup state (a single "last seen" slot plus early recording is what
-// caused spurious mid-turn staging in v0.6.0).
+// Dedup memory for message ids we already staged. The chat.message /
+// prompt hooks fire exactly once per submission, so this is
+// belt-and-suspenders — but it costs nothing and guards against future core
+// changes. Ids are recorded only AFTER every skip check passes, so skipped
+// messages can never poison the dedup state (a single "last seen" slot plus
+// early recording is what caused spurious mid-turn staging in v0.6.0).
 const STAGED_ID_LIMIT = 500
 
 export interface GitAddOnNewTurnOptions {
@@ -27,6 +28,10 @@ export interface GitAddOnNewTurnOptions {
    */
   skipSessionTitlePatterns?: string[]
 }
+
+// ---------------------------------------------------------------------------
+// v1 lane (opencode 1.x) — unchanged from v0.9.0
+// ---------------------------------------------------------------------------
 
 type PartWithFlags = { type: string; synthetic?: boolean; ignored?: boolean }
 
@@ -180,3 +185,270 @@ export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// v2 lane (opencode 2.x) — precise tool-tracked staging
+// ---------------------------------------------------------------------------
+//
+// The 2.x host activates ONLY the module's default export as an object
+// `{ id, server, setup }` and calls `setup(context)` once at startup. The
+// v1 named-function export is never invoked there (the bug v0.10.0 fixes).
+//
+// Mechanism (v2): track file paths touched by write/edit tool calls through
+// the `execute.after` hook (from ALL sessions — subagent writes count as
+// agent changes), then on the next main-session user prompt (`prompt` hook)
+// run `git add -- <paths>` limited to exactly those paths, and clear the
+// set. Turn with no tracked writes → nothing staged. This is deliberately
+// NOT `git add .`: unrelated working-tree changes (e.g. the user's own
+// edits) are never touched.
+//
+// The `prompt` hook fires only for real user submissions — the host does
+// not fire it for plugin-injected synthetic messages (live-verified on
+// 2.0.21), so no parts-based injected-message check is needed on this lane.
+
+// Minimal local types for the v2 plugin context — the hosted API surface
+// this lane touches. Deliberately declared here instead of guessed package
+// types: the v2 context is still moving, and these mirror what
+// `setup(context)` receives on opencode 2.0.21 (live-verified).
+
+/** A session as returned by `session.get({ sessionID })` (envelope: `{data}` or direct). */
+type V2Session = {
+  parentID?: string
+  title?: string
+  location?: { directory?: string }
+}
+
+type V2PromptDraft = {
+  sessionID: string
+  messageID: string
+  prompt: { text: string }
+  delivery?: string
+}
+
+type V2ToolDraft = {
+  sessionID: string
+  tool: string
+  input?: Record<string, unknown>
+  status?: string
+}
+
+export type V2Context = {
+  location?: { directory?: string }
+  options?: GitAddOnNewTurnOptions
+  session?: {
+    hook: (name: "prompt", cb: (draft: V2PromptDraft) => Promise<void>) => Promise<unknown>
+    get: (input: { sessionID: string }) => Promise<{ data?: V2Session } & V2Session>
+  }
+  tool?: {
+    hook: (name: "execute.after", cb: (draft: V2ToolDraft) => Promise<void>) => Promise<unknown>
+  }
+}
+
+export type V2PluginModule = {
+  id: string
+  server: Plugin
+  setup: (context: V2Context) => Promise<void>
+}
+
+// Tools whose input carries the file path the agent wrote.
+const TRACKED_TOOLS = new Set(["write", "edit"])
+
+function isInside(dir: string, abs: string): boolean {
+  const root = resolve(dir)
+  return abs === root || abs.startsWith(root + sep)
+}
+
+// Resolve a tool input path (absolute or relative to the project dir) and
+// make sure it stays inside the project. Returns null for anything else.
+function resolveTrackedPath(dir: string, p: string): string | null {
+  const abs = isAbsolute(p) ? p : resolve(dir, p)
+  return isInside(dir, abs) ? abs : null
+}
+
+function execGit(dir: string, args: string[]): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile("git", args, { cwd: dir }, (error, _stdout, stderr) => {
+      if (error) {
+        const err = error as NodeJS.ErrnoException
+        const code = typeof err.code === "number" ? err.code : 1
+        resolve({ code, stderr: stderr ?? "" })
+        return
+      }
+      resolve({ code: 0, stderr: stderr ?? "" })
+    })
+  })
+}
+
+// Stage exactly the given paths (pathspec-limited — also stages deletions of
+// now-missing files). Never lets a git failure kill the user's message.
+async function stagePaths(directory: string, paths: string[], messageID: string): Promise<boolean> {
+  const rel = paths.map((p) => relative(directory, p))
+  for (let attempt = 1; attempt <= STAGING_ATTEMPTS; attempt++) {
+    const { code, stderr } = await execGit(directory, ["add", "--", ...rel])
+    if (code === 0) return true
+    await journal(
+      `v2 git add attempt ${attempt}/${STAGING_ATTEMPTS} failed (dir=${directory}) exit=${code} stderr=${stderr.trim()} id=${messageID}`,
+    )
+    if (attempt < STAGING_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, STAGING_RETRY_DELAY_MS))
+    }
+  }
+  return false
+}
+
+/**
+ * v2 lane entry point, called by the 2.x host with the hosted plugin context.
+ * Registered once per server/project: pending paths accumulate per project
+ * directory, and staging is gated on main-session user prompts.
+ */
+export async function setup(context: V2Context): Promise<void> {
+  const pluginDir = context.location?.directory
+  const opts = (context.options ?? {}) as GitAddOnNewTurnOptions
+  const skipSessionTitle = (opts.skipSessionTitlePatterns ?? []).map((p) => new RegExp(p))
+
+  // directory -> set of absolute paths touched by write/edit tools since the
+  // last staging. Filled from ALL sessions (subagent writes count as agent
+  // changes); drained only on a main-session prompt in that directory.
+  const pendingByDir = new Map<string, Set<string>>()
+  // sessionID -> project directory, lazily resolved via session.get.
+  const sessionDirs = new Map<string, string>()
+  const stagedMessageIDs = new Set<string>()
+
+  const markStaged = (id: string) => {
+    stagedMessageIDs.add(id)
+    if (stagedMessageIDs.size > STAGED_ID_LIMIT) {
+      const oldest = stagedMessageIDs.values().next().value
+      if (oldest !== undefined) stagedMessageIDs.delete(oldest)
+    }
+  }
+
+  const sessionDirectory = async (sessionID: string): Promise<string | undefined> => {
+    const cached = sessionDirs.get(sessionID)
+    if (cached) return cached
+    const reply = await context.session
+      ?.get({ sessionID })
+      .catch(async (e: unknown) => {
+        await journal(`v2 session.get failed: ${String(e)}`)
+        return undefined
+      })
+    const session = (reply as { data?: V2Session } | undefined)?.data ?? reply
+    const dir = session?.location?.directory ?? pluginDir
+    if (dir) sessionDirs.set(sessionID, dir)
+    return dir
+  }
+
+  await journal(`v2 setup() invoked dir=${pluginDir ?? "(none)"} options=${JSON.stringify(opts)}`)
+
+  // 1) Track write/edit paths from every session.
+  if (context.tool?.hook) {
+    await context.tool.hook("execute.after", async (draft: V2ToolDraft) => {
+      // status is present on failures; only completed writes count.
+      if (draft.status && draft.status !== "completed") return
+      if (!TRACKED_TOOLS.has(draft.tool)) {
+        // apply_patch exposes no path field in its input (just patchText),
+        // the same documented limitation as bash write (see README).
+        if (draft.tool === "apply_patch") {
+          await journal(`v2 untracked: apply_patch input has no path field, skipped`)
+        }
+        return
+      }
+      const p = draft.input?.path
+      if (typeof p !== "string" || p.length === 0) return
+      const dir = await sessionDirectory(draft.sessionID)
+      if (!dir) {
+        await journal(`v2 skip track: no directory for session ${draft.sessionID}`)
+        return
+      }
+      const abs = resolveTrackedPath(dir, p)
+      if (!abs) {
+        await journal(`v2 skip track: path outside project dir=${dir} path=${p}`)
+        return
+      }
+      let set = pendingByDir.get(dir)
+      if (!set) {
+        set = new Set()
+        pendingByDir.set(dir, set)
+      }
+      set.add(abs)
+      await journal(`v2 track tool=${draft.tool} sessionID=${draft.sessionID} path=${relative(dir, abs)}`)
+    })
+  }
+
+  // 2) Stage on the next main-session user prompt.
+  if (context.session?.hook) {
+    await context.session.hook("prompt", async (draft: V2PromptDraft) => {
+      const sessionID = draft.sessionID
+      const id = draft.messageID
+      await journal(`v2 prompt id=${id} sessionID=${sessionID}`)
+      if (stagedMessageIDs.has(id)) {
+        await journal(`v2 skip: already staged id=${id}`)
+        return
+      }
+      const reply = await context.session
+        ?.get({ sessionID })
+        .catch(async (e: unknown) => {
+          await journal(`v2 session.get failed: ${String(e)}`)
+          return undefined
+        })
+      const data = (reply as { data?: V2Session } | undefined)?.data ?? reply
+      if (!data) {
+        console.warn(`[opencode-git-add] could not resolve session ${sessionID}, skipping git add`)
+        await journal(`v2 skip: no session data for ${sessionID}`)
+        return
+      }
+      // Skip subagent turns — same structural parentID signal as the v1
+      // lane; the prompt hook fires in child sessions too (live-verified).
+      const parentID = data.parentID
+      if (parentID) {
+        await journal(`v2 skip: child session "${data.title ?? sessionID}" (parent=${parentID})`)
+        return
+      }
+      for (const pattern of skipSessionTitle) {
+        if (pattern.test(data.title ?? "")) {
+          await journal(`v2 skip: session title "${data.title}" matches ${pattern}`)
+          return
+        }
+      }
+      const dir = data.location?.directory ?? pluginDir
+      if (!dir) {
+        await journal(`v2 skip: no directory for ${sessionID}`)
+        return
+      }
+      const hasGit = await access(join(dir, ".git")).then(
+        () => true,
+        () => false,
+      )
+      if (!hasGit) {
+        await journal(`v2 skip: no .git in ${dir}`)
+        return
+      }
+      const set = pendingByDir.get(dir)
+      if (!set || set.size === 0) {
+        await journal(`v2 skip: nothing to stage in ${dir}`)
+        return
+      }
+      // Record the id only now — after every skip check has passed.
+      markStaged(id)
+
+      const paths = [...set]
+      await journal(`v2 git add ${paths.length} path(s) in ${dir}: ${paths.map((p) => relative(dir, p)).join(", ")}`)
+      const staged = await stagePaths(dir, paths, id)
+      if (staged) {
+        pendingByDir.delete(dir)
+      } else {
+        // Keep the set: the next main-session prompt retries (mirrors the
+        // v1 lane, where a failing turn leaves the diff unstaged for the
+        // next attempt). Never block the message.
+        console.warn(
+          `[opencode-git-add] git add failed after ${STAGING_ATTEMPTS} attempts in ${dir}; continuing without staging`,
+        )
+      }
+    })
+  }
+}
+
+export default {
+  id: "opencode-git-add",
+  server: GitAddOnNewTurn,
+  setup,
+} satisfies V2PluginModule
