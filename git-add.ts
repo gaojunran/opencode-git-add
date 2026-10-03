@@ -194,13 +194,13 @@ export const GitAddOnNewTurn: Plugin = async ({ directory, $, client }, options?
 // `{ id, server, setup }` and calls `setup(context)` once at startup. The
 // v1 named-function export is never invoked there (the bug v0.10.0 fixes).
 //
-// Mechanism (v2): track file paths touched by write/edit tool calls through
-// the `execute.after` hook (from ALL sessions — subagent writes count as
-// agent changes), then on the next main-session user prompt (`prompt` hook)
-// run `git add -- <paths>` limited to exactly those paths, and clear the
-// set. Turn with no tracked writes → nothing staged. This is deliberately
-// NOT `git add .`: unrelated working-tree changes (e.g. the user's own
-// edits) are never touched.
+// Mechanism (v2): track file paths touched by write/edit/apply_patch tool
+// calls through the `execute.after` hook (from ALL sessions — subagent
+// writes count as agent changes), then on the next main-session user prompt
+// (`prompt` hook) run `git add -- <paths>` limited to exactly those paths,
+// and clear the set. Turn with no tracked writes → nothing staged. This is
+// deliberately NOT `git add .`: unrelated working-tree changes (e.g. the
+// user's own edits) are never touched.
 //
 // The `prompt` hook fires only for real user submissions — the host does
 // not fire it for plugin-injected synthetic messages (live-verified on
@@ -230,6 +230,10 @@ type V2ToolDraft = {
   tool: string
   input?: Record<string, unknown>
   status?: string
+  // Present on apply_patch drafts when the host forwards the tool result:
+  // metadata.files[].filePath is the absolute path of each file the patch
+  // actually wrote — the authoritative source over patch-text parsing.
+  result?: { metadata?: { files?: Array<{ filePath?: string }> } }
 }
 
 export type V2Context = {
@@ -250,8 +254,17 @@ export type V2PluginModule = {
   setup: (context: V2Context) => Promise<void>
 }
 
-// Tools whose input carries the file path the agent wrote.
-const TRACKED_TOOLS = new Set(["write", "edit"])
+// Tools whose writes are tracked. write/edit carry the path directly in
+// input.path; apply_patch carries no path field, so its paths come from the
+// patch-text file headers, or from the result metadata files list when the
+// host forwards it (authoritative over header parsing — see below).
+const TRACKED_TOOLS = new Set(["write", "edit", "apply_patch"])
+
+// apply_patch patch-text file-section headers. Every file section opens
+// with one of these lines; `*** Begin Patch` / `*** End Patch` delimit the
+// whole block and match neither regex.
+const APPLY_PATCH_HEADER = /^\*\*\* (Update File|Add File|Delete File|Move to): (.*)$/
+const APPLY_PATCH_RENAME = /^\*\*\* Rename File: (.*) to (.*)$/
 
 function isInside(dir: string, abs: string): boolean {
   const root = resolve(dir)
@@ -263,6 +276,29 @@ function isInside(dir: string, abs: string): boolean {
 function resolveTrackedPath(dir: string, p: string): string | null {
   const abs = isAbsolute(p) ? p : resolve(dir, p)
   return isInside(dir, abs) ? abs : null
+}
+
+/**
+ * Extract the paths an apply_patch patchText touches: each file-section
+ * header (`*** Update File:` / `*** Add File:` / `*** Delete File:`) plus
+ * the rename forms — `*** Rename File: <a> to <b>` and the `*** Update
+ * File: <a>` block followed by `*** Move to: <b>` — where BOTH the old and
+ * the new path count as touched. Returns unique non-empty raw paths, later
+ * resolved and validated like write/edit inputs.
+ */
+function patchTextPaths(patchText: string): string[] {
+  const paths = new Set<string>()
+  for (const line of patchText.split("\n")) {
+    const rename = APPLY_PATCH_RENAME.exec(line)
+    if (rename) {
+      if (rename[1]) paths.add(rename[1])
+      if (rename[2]) paths.add(rename[2])
+      continue
+    }
+    const header = APPLY_PATCH_HEADER.exec(line)
+    if (header && header[2]) paths.add(header[2])
+  }
+  return [...paths]
 }
 
 function execGit(dir: string, args: string[]): Promise<{ code: number; stderr: string }> {
@@ -339,38 +375,62 @@ export async function setup(context: V2Context): Promise<void> {
 
   await journal(`v2 setup() invoked dir=${pluginDir ?? "(none)"} options=${JSON.stringify(opts)}`)
 
-  // 1) Track write/edit paths from every session.
+  // 1) Track write/edit/apply_patch paths from every session.
   if (context.tool?.hook) {
     await context.tool.hook("execute.after", async (draft: V2ToolDraft) => {
       // status is present on failures; only completed writes count.
       if (draft.status && draft.status !== "completed") return
-      if (!TRACKED_TOOLS.has(draft.tool)) {
-        // apply_patch exposes no path field in its input (just patchText),
-        // the same documented limitation as bash write (see README).
-        if (draft.tool === "apply_patch") {
-          await journal(`v2 untracked: apply_patch input has no path field, skipped`)
-        }
-        return
-      }
-      const p = draft.input?.path
-      if (typeof p !== "string" || p.length === 0) return
+      if (!TRACKED_TOOLS.has(draft.tool)) return
       const dir = await sessionDirectory(draft.sessionID)
       if (!dir) {
         await journal(`v2 skip track: no directory for session ${draft.sessionID}`)
         return
       }
-      const abs = resolveTrackedPath(dir, p)
-      if (!abs) {
-        await journal(`v2 skip track: path outside project dir=${dir} path=${p}`)
-        return
+      // path -> tracking source. write/edit carry input.path directly;
+      // apply_patch prefers the result metadata files list (the tool only
+      // reports files it actually wrote) and falls back to parsing the
+      // patch-text file headers.
+      const touched = new Map<string, string>()
+      if (draft.tool === "apply_patch") {
+        const metaFiles = draft.result?.metadata?.files
+        if (Array.isArray(metaFiles) && metaFiles.length > 0) {
+          for (const f of metaFiles) {
+            if (typeof f?.filePath !== "string" || f.filePath.length === 0) continue
+            touched.set(f.filePath, "metadata")
+          }
+        } else {
+          const text = draft.input?.patchText
+          if (typeof text === "string" && text.length > 0) {
+            for (const p of patchTextPaths(text)) touched.set(p, "patchText")
+          }
+        }
+        if (touched.size === 0) {
+          await journal(
+            `v2 untracked: apply_patch with no extractable paths, skipped (sessionID=${draft.sessionID})`,
+          )
+          return
+        }
+      } else {
+        const p = draft.input?.path
+        if (typeof p !== "string" || p.length === 0) return
+        touched.set(p, "input.path")
       }
-      let set = pendingByDir.get(dir)
-      if (!set) {
-        set = new Set()
-        pendingByDir.set(dir, set)
+      for (const [p, source] of touched) {
+        const abs = resolveTrackedPath(dir, p)
+        if (!abs) {
+          await journal(`v2 skip track: path outside project dir=${dir} path=${p}`)
+          continue
+        }
+        let set = pendingByDir.get(dir)
+        if (!set) {
+          set = new Set()
+          pendingByDir.set(dir, set)
+        }
+        set.add(abs)
+        await journal(
+          `v2 track tool=${draft.tool} sessionID=${draft.sessionID} src=${source} dir=${dir} path=${relative(dir, abs)}`,
+        )
       }
-      set.add(abs)
-      await journal(`v2 track tool=${draft.tool} sessionID=${draft.sessionID} path=${relative(dir, abs)}`)
     })
   }
 
