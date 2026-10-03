@@ -1,6 +1,9 @@
 # opencode-git-add
 
-An [opencode](https://opencode.ai) plugin that runs `git add .` at the start of every new conversation turn, in any git repository.
+An [opencode](https://opencode.ai) plugin that freezes the previous turn's agent changes out of the unstaged diff at the start of every new conversation turn, so the unstaged diff always shows only the in-progress turn's changes.
+
+- **opencode 2.x (v2 lane):** stages **exactly the files agent tools touched** since the last turn — `git add -- <paths>` per project directory, tracked from `write`/`edit` tool calls across all sessions (main and subagent).
+- **opencode 1.x (v1 lane):** stages everything (`git add .`) at the start of each main-session turn, as in v0.9.0.
 
 ## Motivation
 
@@ -14,20 +17,40 @@ This plugin implements the workflow that makes #26560 usable for reviewing a sin
 
 1. While a turn is running, the agent's changes accumulate as unstaged changes in the working tree.
 2. When the turn finishes, you review its diff in the editor's unstaged diff view — nothing has been touched yet.
-3. When you start the next turn, the plugin stages everything at that moment (`git add .`), freezing the previous turn's changes out of the unstaged view.
+3. When you start the next turn, the plugin stages what the previous turn left behind, freezing those changes out of the unstaged view.
 4. The unstaged diff now holds only the new turn's changes again — the per-turn review surface that the agent panel diff used to provide.
 
 Timing matters: staging happens at the **start** of the next turn, never at the end of the current one. Staging right after a turn finishes would make the changes you want to review disappear into the staged set before you had a chance to look at them.
 
 ### Who is this for
 
-The plugin fits jujutsu users naturally: jj has no staging area, so staging has no meaning there and auto-running `git add .` interferes with nothing — the plugin simply leaves a clean snapshot boundary between turns.
+The plugin fits jujutsu users naturally: jj has no staging area, so staging has no meaning there and auto-running `git add` interferes with nothing — the plugin simply leaves a clean snapshot boundary between turns.
 
-Plain git users who rely on the staging area should be aware: if you curate commits by selectively staging files (e.g. `git add <file>` before committing only some changes), this plugin will destroy that workflow, because everything gets staged automatically at the start of every turn. It is only a good fit if you always commit everything at once anyway.
+Plain git users who rely on the staging area should be aware: if you curate commits by selectively staging files (e.g. `git add <file>` before committing only some changes), this plugin will destroy that workflow, because agent-written files get staged automatically at the start of every turn. It is only a good fit if you always commit everything at once anyway.
+
+## How it works on opencode 2.x (v0.10.0+)
+
+The 2.x host activates plugins through the module's **default export** — an object `{ id, server, setup }` — and calls `setup(context)` once per server startup with a hosted plugin context. (The v0.9.0 named-function export is never invoked on 2.x; v0.10.0 fixes that by shipping both lanes.)
+
+Two hooks drive the v2 lane:
+
+- **Track** — `context.tool.hook("execute.after", ...)`: after every completed `write`/`edit` tool call (in any session, subagent included), the file path from the tool input (`input.path`, relative or absolute) is recorded in a per-project-directory set. Drafts whose `status` is present and not `"completed"` are ignored, as are paths resolving outside the project directory.
+- **Stage** — `context.session.hook("prompt", ...)`: fires once per real user prompt submission, before any tool runs. If the current main session's directory has a non-empty tracked set, the plugin runs `git add -- <paths>` (a single pathspec-limited command — this also stages deletions of now-missing files), then clears the set. If the set is empty, nothing runs at all.
+
+Guards on the v2 lane (mirroring the v1 lane): the session is resolved via `context.session.get({ sessionID })` and staging is skipped for child sessions (any session with a `parentID`, e.g. subagents spawned by the task tool — their own prompts never stage) and for sessions whose title matches a configured pattern; the `.git` existence check applies per session directory; and the same message id only ever triggers once. Staging never kills your message: git failures (most commonly `.git/index.lock` contention, exit 128) are retried 3 times with 500ms between attempts, then reported and the turn proceeds anyway.
+
+Two documented limitations of precise (path-tracked) staging:
+
+- **bash write is invisible.** Any file changed through a `bash` tool call (or any non-`write`/`edit` tool) is not tracked and will not be staged by the next turn — the per-turn boundary then simply does not apply to that file until a later `write`/`edit` touches it.
+- **`apply_patch` is invisible.** Its tool input carries only the patch text, no path field, so nothing can be tracked from it (same reason as bash).
+
+Injected messages are not an issue on this lane: the host fires the `prompt` hook only for real submissions. Plugin injections via `context.session.synthetic` (how magic-context posts its nudges) do **not** fire the hook (live-verified on 2.0.21), and explicit `context.session.prompt` submissions are indistinguishable from a user prompt by design — exactly like an unflagged API submission on the v1 lane.
+
+**Options on 2.x:** the config tuple form (`["opencode-git-add", {...}]`) is not accepted by the 2.0.21 config loader for `file:` specs — declare plugins as plain strings. `context.options` is read when the host provides it, so `skipSessionTitlePatterns` works as soon as (and wherever) the host passes options through; on 1.x it is passed via the options tuple as before.
 
 ## Why a plugin instead of config
 
-opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "at the start of each turn" are only possible through the [plugin hook system](https://opencode.ai/docs/plugins/). This plugin uses the `chat.message` hook, which fires exactly once per prompt submission — before the message is persisted and before any tool runs.
+opencode's `opencode.json` has no native hook/event support (see the [config schema](https://opencode.ai/config.json)). Timing hooks like "at the start of each turn" are only possible through the [plugin hook system](https://opencode.ai/docs/plugins/).
 
 ## Installation
 
@@ -42,7 +65,7 @@ Add it to the `plugin` array in `opencode.json`:
 }
 ```
 
-Optional configuration, as an options tuple (see [plugins docs](https://opencode.ai/docs/plugins/)):
+Optional configuration on 1.x hosts, as an options tuple (see [plugins docs](https://opencode.ai/docs/plugins/)):
 
 ```json
 {
@@ -57,7 +80,7 @@ Optional configuration, as an options tuple (see [plugins docs](https://opencode
 }
 ```
 
-`skipSessionTitlePatterns` takes an array of regex strings; sessions whose title matches any of them are skipped. It is **empty by default** — the injected-message check below already covers every known source (magic-context, slim and opencode's own task machinery all mark their injected parts `synthetic`/`ignored`), so this option is only needed for exotic sessions whose messages cannot be inspected.
+`skipSessionTitlePatterns` takes an array of regex strings; sessions whose title matches any of them are skipped. It is **empty by default** — child-session skipping is structural (the session-DB `parentID`), and injected messages are skipped structurally too, so this option is only needed for exotic session-title rules of your own.
 
 ### Manual
 
@@ -72,17 +95,33 @@ Restart opencode afterwards — configuration is only loaded at startup. No chan
 
 ## Behavior
 
-- **Trigger:** the `chat.message` hook — the moment you submit a new prompt and a new turn begins. opencode fires it exactly once per submission, before the message is persisted and before the agent starts doing anything, and never re-fires it when the message row is later updated (e.g. diff-summary recomputation). Earlier versions listened to the `message.updated` bus event instead, which opencode re-broadcasts on every summary update — combined with plugin-injected synthetic messages, that could cause spurious mid-turn staging (fixed in v0.7.0).
-- **Main sessions only:** subagent sessions are skipped. A session is a subagent when it has a parent session (`parentID` in the session DB) — opencode's task tool creates child sessions that way, and this structural signal also covers child sessions whose titles never follow a convention (e.g. magic-context compartments). Earlier versions additionally skipped sessions whose title matched `<description> (@<agent> subagent)`; that title-convention check is redundant and gone, because the session store contains no subagent session without a `parentID`. If the session cannot be resolved (e.g. an API hiccup), the plugin skips and logs a warning instead of staging at a wrong moment.
-- **No injected messages:** opencode plugins can inject user-role messages into a session via the server API (e.g. magic-context's progress notices and summary posts), and those fire `chat.message` too. The hook carries the message's parts inline, so the plugin skips staging synchronously when every part carries the `synthetic` or `ignored` flag (or when there are no parts to inspect) — real user input always has at least one unflagged text part.
-- **Dedup:** the same message ID only triggers once, and skipped messages never record into the dedup set, so injected messages cannot interfere with real turns.
-- **Guard:** runs only when a `.git` directory exists in the plugin's working directory (this includes jujutsu colocated working copies). Non-git directories are skipped.
-- **Action:** `git add .` in the working directory, without recursing into nested projects.
-- **Never blocks your message:** staging is a convenience, not a gate. If `git add .` fails (most commonly a concurrent git process holding `.git/index.lock`, which exits 128), the plugin retries up to 3 times with 500ms between attempts, then reports a warning and lets the turn proceed anyway — a transient git failure can never kill your submitted message. The failing git stderr is journaled for diagnosis (see Debugging).
+### v2 lane (opencode 2.x) — precise tool-tracked staging
+
+- **Trigger:** the `prompt` hook — fires once per user prompt submission, before the message is processed and before any tool runs (live-verified on 2.0.21).
+- **Tracked writes:** `write`/`edit` tool calls from **every** session in the project directory, subagents included. The set is drained only by a **main-session** prompt (`parentID` absent), so a subagent's writes are staged by the next main-session turn — never mid-turn.
+- **Precision:** `git add -- <paths>` — only files the tools actually touched are ever staged; a `git add .` never runs. Files you edited yourself in the working tree stay unstaged.
+- **Empty turns stage nothing:** if no tracked writes accumulated since the last staging, the prompt hook returns without running git at all.
+- **Dedup:** the same message ID only triggers once.
+- **Guard:** runs only when a `.git` directory exists in the session's directory (includes jujutsu colocated working copies). Non-git directories are skipped.
+- **Never blocks your message:** git failures are retried up to 3 times with 500ms between attempts, then a warning (`console.warn` + journal) and the turn proceeds anyway. A failed staging keeps the tracked set, so the next main-session prompt retries.
+- **Session resolution:** `context.session.get({ sessionID })`; if the session cannot be resolved, staging is skipped with a warning rather than risking a wrong-moment stage.
+
+### v1 lane (opencode 1.x) — unchanged from v0.9.0
+
+- **Trigger:** the `chat.message` hook — exactly once per prompt submission, before the message is persisted and before any tool runs. (The older `message.updated` trigger re-broadcast on every diff-summary recomputation and picked up plugin-injected synthetic messages — that caused spurious mid-turn staging and was fixed in v0.7.0.)
+- **Main sessions only:** child sessions are skipped via the session-DB `parentID` — a structural signal that also covers children whose titles never follow a convention (e.g. magic-context compartments).
+- **No injected messages:** messages whose parts all carry the `synthetic`/`ignored` flag (or that have no parts) are skipped synchronously.
+- **Action:** `git add .` in the plugin's working directory, without recursing into nested projects. (The v1 lane cannot know which files a tool touched, so it stages everything — the per-turn boundary is what matters there.)
+- Guard, dedup and never-block semantics: same as the v2 lane, with warnings via `client.app.log`.
 
 ## Verification
 
-`scripts/verify.ts` covers 14 scenarios: main-session user message with real parts in a plain git repo → staged; subagent-style session title without a `parentID` → still staged (only the session-DB `parentID` classifies a child session); session with a `parentID` (task-tool subagents, magic-context compartments) → skipped; session lookup 404 / rejected → skipped without error; only `.jj` → skipped; injected messages (synthetic-only parts, ignored-only parts, empty parts) → skipped; same message id fired twice → staged only once; a skipped synthetic message followed by a real message → still staged (dedup cannot be poisoned); user-configured `skipSessionTitlePatterns` → skipped; mixed synthetic + real parts → staged; `git add .` failing while `.git/index.lock` is held → hook retries, does not throw, stages nothing, and a later turn stages normally once the lock is gone. Run with:
+`scripts/verify.ts` covers 25 scenarios with real git repositories:
+
+- v1 lane (1–14): main-session user message with real parts in a plain git repo → staged; subagent-style session title without a `parentID` → still staged; session with a `parentID` → skipped; session lookup 404 / rejected → skipped without error; only `.jj` → skipped; injected messages (synthetic-only, ignored-only, empty parts) → skipped; same message id fired twice → staged only once; a skipped synthetic message followed by a real one → still staged (dedup cannot be poisoned); user-configured `skipSessionTitlePatterns` → skipped; mixed synthetic + real parts → staged; `git add .` failing while `.git/index.lock` is held → retries, does not throw, and a later turn stages normally.
+- v2 lane (15–25): a `write` tracked from a main session is staged by the next prompt **exactly** (a manually edited file is never staged); a subagent's `edit` with an absolute path is tracked, the child's own prompt does not stage, the next main prompt does; a turn with no tracked writes stages nothing; a tool draft with `status` ≠ `"completed"` is not tracked; a path resolving outside the project is not tracked; `apply_patch` (no path field) is not tracked; message-id dedup; title-pattern option via `context.options`; session lookup failure skips without error; no `.git` skips without error; staging failure with a held `index.lock` retries 3 times without throwing, and a later prompt stages normally.
+
+Run with:
 
 ```sh
 bun scripts/verify.ts
@@ -91,11 +130,12 @@ bun scripts/verify.ts
 ## License
 
 MIT
+
 ## Debugging
 
-The hook journals every event it sees and the decision taken to
-`/tmp/opencode-git-add.log` (append-only, safe to leave on). When a staging
-failure is retried, the failing attempt count, exit code and **git stderr**
-are journaled too. When reporting a misbehaviour, include that file — it
-shows exactly which events fired, in what order, whether staging ran, and
-why it failed.
+The plugin journals every hook event and the decision taken to
+`/tmp/opencode-git-add.log` (append-only, safe to leave on). v2-lane lines are
+prefixed `v2 `. When a staging failure is retried, the failing attempt count,
+exit code and **git stderr** are journaled too. When reporting a misbehaviour,
+include that file — it shows exactly which events fired, in what order,
+whether staging ran, and why it failed.
