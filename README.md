@@ -1,5 +1,15 @@
 # opencode-git-add
 
+> [!WARNING]
+> **Deprecated.** The problem this plugin solves only exists on specific ACP
+> clients — e.g. [Zed](https://zed.dev)'s unstaged-changes review workflow for
+> external ACP agents. If you use such a client, the recommended solution is
+> [opencode-acp-bridge](https://github.com/gaojunran/opencode-acp-bridge) with
+> its built-in `--zed-git-add` flag (v0.8.0+): the same turn-scoped staging,
+> implemented natively in the bridge — driven by the server's snapshot diffs,
+> so it also covers files written via `bash` — with no extra plugin to install.
+> This plugin is no longer maintained.
+
 An [opencode](https://opencode.ai) plugin that freezes the previous turn's agent changes out of the unstaged diff at the start of every new conversation turn, so the unstaged diff always shows only the in-progress turn's changes.
 
 - **opencode 2.x (v2 lane):** stages **exactly the files agent tools touched** since the last turn — `git add -- <paths>` per project directory, tracked from `write`/`edit`/`apply_patch` tool calls across all sessions (main and subagent).
